@@ -1,131 +1,131 @@
 package com.github.yournamehere
 
 import android.content.Context
+import android.content.res.ColorStateList
+import android.view.View
+import android.widget.TextView
+import androidx.recyclerview.widget.RecyclerView
 import com.aliucord.Utils
 import com.aliucord.annotations.AliucordPlugin
 import com.aliucord.api.CommandsAPI
-import com.aliucord.entities.MessageEmbedBuilder
 import com.aliucord.entities.Plugin
-import com.aliucord.patcher.*
-import com.aliucord.wrappers.embeds.MessageEmbedWrapper.Companion.title
+import com.aliucord.patcher.Hook
+import com.aliucord.patcher.after
 import com.discord.api.commands.ApplicationCommandType
-import com.discord.models.user.CoreUser
-import com.discord.stores.StoreUserTyping
+import com.discord.utilities.icon.IconUtils
 import com.discord.widgets.chat.list.adapter.WidgetChatListAdapterItemMessage
 import com.discord.widgets.chat.list.entries.ChatListEntry
 import com.discord.widgets.chat.list.entries.MessageEntry
+import org.json.JSONObject
 
-// Aliucord Plugin annotation. Must be present on the main class of your plugin
-// Plugin class. Must extend Plugin and override start and stop
-// Learn more: https://github.com/Aliucord/documentation/blob/main/plugin-dev/1_introduction.md#basic-plugin-structure
-@AliucordPlugin(
-    requiresRestart = false, // Whether your plugin requires a restart after being installed/updated
-)
-@Suppress("unused")
-class MyFirstKotlinPlugin : Plugin() {
+@AliucordPlugin
+class LocalEditor : Plugin() {
+
+    private fun load(key: String) = JSONObject(settings.getString(key, "{}"))
+
+    private fun put(key: String, id: String, value: String?) {
+        val o = load(key)
+        if (value == null) o.remove(id) else o.put(id, value)
+        settings.setString(key, o.toString())
+    }
+
     override fun start(context: Context) {
-        // Register a command with the name hello and description "My first command!" and no arguments.
-        // Learn more: https://github.com/Aliucord/documentation/blob/main/plugin-dev/2_commands.md
-        commands.registerCommand("hello", "My first command!") {
-            // Just return a command result with hello world as the content
-            CommandsAPI.CommandResult(
-                "Hello World!",
-                null, // List of embeds
-                false, // Whether to send visible for everyone
-            )
-        }
-
-        // A bit more advanced command with arguments
-        commands.registerCommand(
-            "hellowitharguments",
-            "Hello World but with arguments!",
-            listOf(
-                Utils.createCommandOption(
-                    ApplicationCommandType.STRING,
-                    "name",
-                    "Person to say hello to",
-                ),
-                Utils.createCommandOption(
-                    ApplicationCommandType.USER,
-                    "user",
-                    "User to say hello to",
-                ),
+        patcher.patch(
+            IconUtils::class.java.getDeclaredMethod(
+                "getForUser",
+                java.lang.Long::class.java, String::class.java, Integer::class.java,
+                java.lang.Boolean.TYPE, Integer::class.java
             ),
-        ) { ctx ->
-            // Check if a user argument was passed
-            val username = if (ctx.containsArg("user")) {
-                ctx.getRequiredUser("user").username
-            } else {
-                // Returns either the argument value if present, or the defaultValue ("World" in this case)
-                ctx.getStringOrDefault("name", "World")
+            Hook { param ->
+                val id = (param.args[0] as? Long)?.toString() ?: return@Hook
+                val url = load("avatars").optString(id, "")
+                if (url.isNotEmpty()) param.result = url
             }
+        )
 
-            // Return the final result that will be displayed in chat as a response to the command
-            CommandsAPI.CommandResult("Hello $username!")
-        }
-
-        // Patch that adds an embed with message statistics to each message
-        // Patched method is WidgetChatListAdapterItemMessage.onConfigure(int type, ChatListEntry entry)
         patcher.after<WidgetChatListAdapterItemMessage>(
-            "onConfigure", // Method name
-            // Refer to https://kotlinlang.org/docs/reflection.html#class-references
-            // and https://docs.oracle.com/javase/tutorial/reflect/class/classNew.html
-            Int::class.java, // int type
-            ChatListEntry::class.java, // ChatListEntry entry
+            "onConfigure", Int::class.java, ChatListEntry::class.java
         ) { param ->
-            // see https://api.xposed.info/reference/de/robv/android/xposed/XC_MethodHook.MethodHookParam.html
-            // Obtain the second argument passed to the method, so the ChatListEntry
-            // Because this is a Message item, it will always be a MessageEntry, so cast it to that
-            val entry = param.args[1] as MessageEntry
-            val message = entry.message
+            val entry = param.args[1] as? MessageEntry ?: return@after
+            val msg = entry.message
+            val root = (param.thisObject as RecyclerView.ViewHolder).itemView
 
-            // You need to be careful when messing with messages, because they may be loading
-            // (user sent a message, and it is currently sending)
-            if (message.isLoading) return@after
-
-            // Now add an embed with the statistics
-
-            // This method may be called multiple times per message, e.g. if it is edited,
-            // so first remove existing embeds
-            message.embeds.removeAll {
-                // MessageEmbed.getTitle() is actually obfuscated, but Aliucord provides extensions for commonly used
-                // obfuscated Discord classes, so just import the MessageEmbed.title extension and boom goodbye obfuscation!
-                it.title == "Message Statistics"
+            val newText = load("messages").optString(msg.id.toString(), "")
+            if (newText.isNotEmpty()) {
+                val tv = root.findViewById<TextView>(Utils.getResId("chat_list_adapter_item_text", "id"))
+                tv?.text = newText
             }
 
-            // Creating embeds is a pain, so Aliucord provides a convenient builder
-            MessageEmbedBuilder().run {
-                setTitle("Message Statistics")
-                addField("Length", "${message.content?.length ?: 0}", false)
-                addField("ID", message.id.toString(), false)
-
-                message.embeds.add(build())
-            }
-        }
-
-        // Patch that renames Juby to JoobJoob
-        patcher.before<CoreUser>("getUsername") { param ->
-            // see https://api.xposed.info/reference/de/robv/android/xposed/XC_MethodHook.MethodHookParam.html
-            // in before, after and instead patches, `this` refers to the instance of the class
-            // the patched method is on, so the CoreUser instance here
-            if (id == 925141667688878090) {
-                // setResult() in before patches skips original method invocation
-                param.result = "JoobJoob"
+            val tagText = load("tags").optString(msg.author.id.toString(), "")
+            if (tagText.isNotEmpty()) {
+                val tag = root.findViewById<TextView>(Utils.getResId("chat_list_adapter_item_text_tag", "id"))
+                if (tag != null) {
+                    tag.visibility = View.VISIBLE
+                    tag.text = tagText
+                    if (load("official").has(msg.author.id.toString())) {
+                        tag.backgroundTintList = ColorStateList.valueOf(0xFF5865F2.toInt())
+                        for (name in listOf("ic_verified_badge", "ic_verified_10dp", "ic_check_16dp")) {
+                            val res = Utils.getResId(name, "drawable")
+                            if (res != 0) {
+                                tag.setCompoundDrawablesWithIntrinsicBounds(res, 0, 0, 0)
+                                break
+                            }
+                        }
+                    }
+                }
             }
         }
 
-        // Patch that hides your typing status by replacing the method and simply doing nothing
-        patcher.instead<StoreUserTyping>(
-            "setUserTyping",
-            Long::class.java, // java.lang.Long channelId
-        ) {
-            // Return null
-            null
+        val user = { Utils.createCommandOption(ApplicationCommandType.USER, "user", "Target user", required = true) }
+
+        commands.registerCommand(
+            "ltag", "Set a local tag on a user",
+            listOf(
+                user(),
+                Utils.createCommandOption(ApplicationCommandType.STRING, "text", "Tag text, any length", required = true),
+                Utils.createCommandOption(ApplicationCommandType.BOOLEAN, "official", "Blurple official-style tag")
+            )
+        ) { ctx ->
+            val id = ctx.getRequiredUser("user").id.toString()
+            put("tags", id, ctx.getRequiredString("text"))
+            put("official", id, if (ctx.getBoolOrDefault("official", false)) "1" else null)
+            CommandsAPI.CommandResult("Tag set. Reopen the channel to refresh.", null, false)
+        }
+
+        commands.registerCommand(
+            "lavatar", "Set a local avatar URL for a user",
+            listOf(
+                user(),
+                Utils.createCommandOption(ApplicationCommandType.STRING, "url", "Direct image link", required = true)
+            )
+        ) { ctx ->
+            put("avatars", ctx.getRequiredUser("user").id.toString(), ctx.getRequiredString("url"))
+            CommandsAPI.CommandResult("Avatar set. Restart the app if it doesn't change.", null, false)
+        }
+
+        commands.registerCommand(
+            "lmsg", "Locally edit a message (needs the message ID)",
+            listOf(
+                Utils.createCommandOption(ApplicationCommandType.STRING, "id", "Message ID", required = true),
+                Utils.createCommandOption(ApplicationCommandType.STRING, "text", "New text", required = true)
+            )
+        ) { ctx ->
+            put("messages", ctx.getRequiredString("id"), ctx.getRequiredString("text"))
+            CommandsAPI.CommandResult("Message edited. Reopen the channel to refresh.", null, false)
+        }
+
+        commands.registerCommand(
+            "lclear", "Remove local edits for a user",
+            listOf(user())
+        ) { ctx ->
+            val id = ctx.getRequiredUser("user").id.toString()
+            for (k in listOf("tags", "official", "avatars")) put(k, id, null)
+            CommandsAPI.CommandResult("Cleared.", null, false)
         }
     }
 
     override fun stop(context: Context) {
-        // Remove all patches
         patcher.unpatchAll()
+        commands.unregisterAll()
     }
 }

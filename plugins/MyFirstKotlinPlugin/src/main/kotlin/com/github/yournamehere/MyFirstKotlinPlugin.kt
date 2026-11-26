@@ -1,21 +1,36 @@
 package com.github.yournamehere
 
-import android.app.AlertDialog
+import android.app.Dialog
 import android.content.Context
 import android.content.res.ColorStateList
+import android.graphics.Color
+import android.graphics.PorterDuff
+import android.graphics.Typeface
+import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.Drawable
+import android.graphics.drawable.GradientDrawable
 import android.os.Handler
 import android.os.Looper
+import android.text.Editable
 import android.text.InputFilter
+import android.text.InputType
+import android.text.SpannableStringBuilder
+import android.text.TextWatcher
 import android.util.Log
+import android.util.TypedValue
+import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.Window
+import android.view.WindowManager
+import android.view.inputmethod.InputMethodManager
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
-import android.widget.Toast
 import androidx.recyclerview.widget.RecyclerView
 import com.aliucord.Utils
 import com.aliucord.annotations.AliucordPlugin
@@ -36,33 +51,51 @@ import java.util.WeakHashMap
 class LocalEditor : Plugin() {
 
     private class Orig(val tint: ColorStateList?, val colors: ColorStateList?)
+    private class InlineInfo(val content: TextView, val oldMin: Int)
+    private class Field(
+        val key: String, val label: String, val kind: Int, val value: String,
+        val options: List<String> = emptyList()
+    )
 
     private val origs = WeakHashMap<View, Orig>()
     private val hiddenByUs = WeakHashMap<View, MutableList<View>>()
+    private val inlineInfo = WeakHashMap<View, InlineInfo>()
+    private val penciled = WeakHashMap<View, Boolean>()
+    private val decoUrls = WeakHashMap<View, String>()
+    private val origNames = HashMap<String, String>()
     private var chatRef: WeakReference<RecyclerView>? = null
+    private var editingMid: String? = null
+    private var draft = ""
     private val ui = Handler(Looper.getMainLooper())
+
     private val botTagId = "chat_list_adapter_item_text_tag"
     private val guildKeys = listOf("clan", "guild_tag", "guildtag", "primary_guild", "server_tag", "guild_badge")
 
+    private val cText = 0xFFDBDEE1.toInt()
+    private val cMuted = 0xFF949BA4.toInt()
+    private val cBg = 0xFF313338.toInt()
+    private val cDark = 0xFF1E1F22.toInt()
+    private val cBlurple = 0xFF5865F2.toInt()
+    private val cRed = 0xFFDA373C.toInt()
+    private val cGray = 0xFF4E5058.toInt()
+
     // ---------- storage ----------
-    private fun load(key: String) = JSONObject(settings.getString(key, "{}"))
+    private fun loadObj(key: String) = JSONObject(settings.getString(key, "{}"))
 
-    private fun put(key: String, id: String, value: String?) {
-        val o = load(key)
-        if (value == null || value.isEmpty()) o.remove(id) else o.put(id, value)
-        settings.setString(key, o.toString())
+    private fun userCfg(uid: String): JSONObject? = loadObj("users").optJSONObject(uid)
+
+    private fun saveUser(uid: String, cfg: JSONObject?) {
+        val all = loadObj("users")
+        if (cfg == null || cfg.length() == 0) all.remove(uid) else all.put(uid, cfg)
+        settings.setString("users", all.toString())
     }
 
-    private fun saveTag(uid: String, text: String, official: Boolean, noBadge: Boolean) {
-        val all = load("tagdata")
-        if (text.isEmpty()) all.remove(uid)
-        else all.put(uid, JSONObject().put("t", text).put("o", official).put("nb", noBadge))
-        settings.setString("tagdata", all.toString())
-    }
-
-    private fun clearUser(uid: String) {
-        saveTag(uid, "", false, false)
-        put("avatars", uid, null)
+    private fun setMsgField(mid: String, key: String, value: String?) {
+        val all = loadObj("msgs")
+        val o = all.optJSONObject(mid) ?: JSONObject()
+        if (value == null || value.isEmpty()) o.remove(key) else o.put(key, value)
+        if (o.length() == 0) all.remove(mid) else all.put(mid, o)
+        settings.setString("msgs", all.toString())
     }
 
     // ---------- helpers ----------
@@ -86,15 +119,11 @@ class LocalEditor : Plugin() {
         ui.post { chatRef?.get()?.adapter?.notifyDataSetChanged() }
     }
 
-    private fun firstTextView(v: View): TextView? {
-        if (v is TextView) return v
+    private fun walk(v: View, fn: (View) -> Unit) {
+        fn(v)
         if (v is ViewGroup) {
-            for (i in 0 until v.childCount) {
-                val r = firstTextView(v.getChildAt(i))
-                if (r != null) return r
-            }
+            for (i in 0 until v.childCount) walk(v.getChildAt(i), fn)
         }
-        return null
     }
 
     private fun findById(v: View, name: String): View? {
@@ -108,7 +137,319 @@ class LocalEditor : Plugin() {
         return null
     }
 
-    // finds the visible server-tag view in a message row (not the BOT tag)
+    private fun firstTextView(v: View): TextView? {
+        if (v is TextView) return v
+        if (v is ViewGroup) {
+            for (i in 0 until v.childCount) {
+                val r = firstTextView(v.getChildAt(i))
+                if (r != null) return r
+            }
+        }
+        return null
+    }
+
+    private fun copyParams(lp: ViewGroup.LayoutParams?): ViewGroup.LayoutParams? {
+        if (lp == null) return null
+        return try {
+            lp.javaClass.getConstructor(lp.javaClass).newInstance(lp) as ViewGroup.LayoutParams
+        } catch (e: Throwable) {
+            ViewGroup.LayoutParams(lp.width, lp.height)
+        }
+    }
+
+    private fun hide(root: View, v: View) {
+        v.visibility = View.GONE
+        hiddenByUs.getOrPut(root) { mutableListOf() }.add(v)
+    }
+
+    private fun hideKeyboard(v: View) {
+        try {
+            val imm = v.context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+            imm.hideSoftInputFromWindow(v.windowToken, 0)
+        } catch (e: Throwable) {
+        }
+    }
+
+    // ---------- dark UI building blocks ----------
+    private fun rounded(color: Int, radius: Int): GradientDrawable {
+        val g = GradientDrawable()
+        g.setColor(color)
+        g.cornerRadius = radius.toFloat()
+        return g
+    }
+
+    private fun makeLabel(ctx: Context, text: String, sizeSp: Float, color: Int, bold: Boolean): TextView {
+        val t = TextView(ctx)
+        t.text = text
+        t.textSize = sizeSp
+        t.setTextColor(color)
+        if (bold) t.setTypeface(t.typeface, Typeface.BOLD)
+        return t
+    }
+
+    private fun makeButton(ctx: Context, text: String, color: Int, onClick: () -> Unit): TextView {
+        val b = makeLabel(ctx, text, 14f, Color.WHITE, true)
+        b.gravity = Gravity.CENTER
+        b.background = rounded(color, dp(ctx, 8))
+        val p = dp(ctx, 10)
+        b.setPadding(p * 2, p, p * 2, p)
+        val lp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        lp.setMargins(dp(ctx, 4), dp(ctx, 4), dp(ctx, 4), dp(ctx, 4))
+        b.layoutParams = lp
+        b.setOnClickListener { onClick() }
+        return b
+    }
+
+    private fun darkEdit(ctx: Context, value: String, hint: String): EditText {
+        val et = EditText(ctx)
+        et.setText(value)
+        et.hint = hint
+        et.setTextColor(cText)
+        et.setHintTextColor(cMuted)
+        et.background = rounded(cDark, dp(ctx, 8))
+        val p = dp(ctx, 10)
+        et.setPadding(p, p, p, p)
+        et.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+        return et
+    }
+
+    private fun openDialog(ctx: Context, dlg: Dialog, root: View, heightFraction: Float) {
+        dlg.setContentView(root)
+        dlg.setCanceledOnTouchOutside(true)
+        dlg.window?.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+        dlg.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+        dlg.show()
+        val w = (ctx.resources.displayMetrics.widthPixels * 0.92f).toInt()
+        val h = if (heightFraction > 0f) (ctx.resources.displayMetrics.heightPixels * heightFraction).toInt()
+        else ViewGroup.LayoutParams.WRAP_CONTENT
+        dlg.window?.setLayout(w, h)
+    }
+
+    // kind 0 = text box, 1 = on/off, 2 = pick one
+    private fun showForm(
+        ctx: Context, title: String, fields: List<Field>,
+        onSave: (Map<String, String>) -> Unit, onReset: (() -> Unit)?
+    ) {
+        val dlg = Dialog(ctx)
+        dlg.requestWindowFeature(Window.FEATURE_NO_TITLE)
+
+        val root = LinearLayout(ctx)
+        root.orientation = LinearLayout.VERTICAL
+        root.background = rounded(cBg, dp(ctx, 14))
+        val pad = dp(ctx, 16)
+        root.setPadding(pad, pad, pad, pad)
+        root.addView(makeLabel(ctx, title, 18f, cText, true))
+
+        val body = LinearLayout(ctx)
+        body.orientation = LinearLayout.VERTICAL
+        val getters = LinkedHashMap<String, () -> String>()
+
+        for (f in fields) {
+            when (f.kind) {
+                1 -> {
+                    val cb = CheckBox(ctx)
+                    cb.text = f.label
+                    cb.setTextColor(cText)
+                    cb.buttonTintList = ColorStateList.valueOf(cBlurple)
+                    cb.isChecked = f.value == "1"
+                    cb.setPadding(0, dp(ctx, 6), 0, dp(ctx, 6))
+                    body.addView(cb)
+                    getters[f.key] = { if (cb.isChecked) "1" else "0" }
+                }
+                2 -> {
+                    val cap = makeLabel(ctx, f.label, 12f, cMuted, false)
+                    cap.setPadding(0, dp(ctx, 12), 0, dp(ctx, 4))
+                    body.addView(cap)
+                    var sel = f.value
+                    val chips = ArrayList<TextView>()
+                    val rowv = LinearLayout(ctx)
+                    fun restyle() {
+                        for (c in chips) {
+                            c.background = rounded(if (c.text.toString() == sel) cBlurple else cDark, dp(ctx, 14))
+                        }
+                    }
+                    for (o in f.options) {
+                        val chip = makeLabel(ctx, o, 13f, cText, false)
+                        val cp = dp(ctx, 10)
+                        chip.setPadding(cp * 2, cp, cp * 2, cp)
+                        val clp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                        clp.setMargins(0, 0, dp(ctx, 6), 0)
+                        chip.layoutParams = clp
+                        chip.setOnClickListener {
+                            sel = if (sel == o) "" else o
+                            restyle()
+                        }
+                        chips.add(chip)
+                        rowv.addView(chip)
+                    }
+                    restyle()
+                    body.addView(rowv)
+                    getters[f.key] = { sel }
+                }
+                else -> {
+                    val cap = makeLabel(ctx, f.label, 12f, cMuted, false)
+                    cap.setPadding(0, dp(ctx, 12), 0, dp(ctx, 4))
+                    body.addView(cap)
+                    val et = darkEdit(ctx, f.value, "")
+                    body.addView(et, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+                    getters[f.key] = { et.text.toString() }
+                }
+            }
+        }
+
+        val sv = ScrollView(ctx)
+        sv.addView(body)
+        root.addView(sv, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+
+        val btns = LinearLayout(ctx)
+        btns.orientation = LinearLayout.HORIZONTAL
+        btns.setPadding(0, dp(ctx, 12), 0, 0)
+        btns.addView(makeButton(ctx, "Cancel", cGray) { dlg.dismiss() })
+        if (onReset != null) {
+            btns.addView(makeButton(ctx, "Reset", cRed) {
+                dlg.dismiss()
+                onReset()
+            })
+        }
+        btns.addView(makeButton(ctx, "Save", cBlurple) {
+            val out = LinkedHashMap<String, String>()
+            for ((k, g) in getters) out[k] = g()
+            dlg.dismiss()
+            onSave(out)
+        })
+        root.addView(btns, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        openDialog(ctx, dlg, root, 0f)
+    }
+
+    private fun showInfo(ctx: Context, title: String, text: String) {
+        val dlg = Dialog(ctx)
+        dlg.requestWindowFeature(Window.FEATURE_NO_TITLE)
+        val root = LinearLayout(ctx)
+        root.orientation = LinearLayout.VERTICAL
+        root.background = rounded(cBg, dp(ctx, 14))
+        val pad = dp(ctx, 16)
+        root.setPadding(pad, pad, pad, pad)
+        root.addView(makeLabel(ctx, title, 18f, cText, true))
+        val tv = makeLabel(ctx, text, 10f, cText, false)
+        tv.typeface = Typeface.MONOSPACE
+        tv.setTextIsSelectable(true)
+        val sv = ScrollView(ctx)
+        sv.addView(tv)
+        root.addView(sv, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        val close = makeButton(ctx, "Close", cBlurple) { dlg.dismiss() }
+        close.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        root.addView(close)
+        openDialog(ctx, dlg, root, 0.85f)
+    }
+
+    // ---------- forms ----------
+    private fun showUserForm(ctx: Context, uid: String, displayName: String) {
+        val c = userCfg(uid) ?: JSONObject()
+        fun tog(k: String) = if (c.optBoolean(k, false)) "1" else "0"
+        showForm(
+            ctx, "Edit $displayName",
+            listOf(
+                Field("name", "Display name", 0, c.optString("name", "")),
+                Field("tag", "Tag text (any length, symbols OK)", 0, c.optString("tag", "")),
+                Field("official", "Official style (blue check tag, replaces server tag)", 1, tog("official")),
+                Field("hideTag", "Hide their existing server tag", 1, tog("hideTag")),
+                Field("hideBadge", "Hide the server tag icon", 1, tog("hideBadge")),
+                Field("avatar", "Avatar image URL (direct link)", 0, c.optString("avatar", "")),
+                Field("deco", "Avatar decoration image URL (type hide to remove it)", 0, c.optString("deco", "")),
+                Field("status", "Status (profile only)", 2, c.optString("status", ""), listOf("online", "idle", "dnd", "offline")),
+                Field("statusText", "Status text (profile only)", 0, c.optString("statusText", ""))
+            ),
+            { out ->
+                val o = JSONObject()
+                for (k in listOf("name", "tag", "avatar", "deco", "statusText")) {
+                    val v = (out[k] ?: "").trim()
+                    if (v.isNotEmpty()) o.put(k, v)
+                }
+                for (k in listOf("official", "hideTag", "hideBadge")) {
+                    if (out[k] == "1") o.put(k, true)
+                }
+                val st = out["status"] ?: ""
+                if (st.isNotEmpty()) o.put("status", st)
+                saveUser(uid, o)
+                refreshChat()
+            },
+            {
+                saveUser(uid, null)
+                refreshChat()
+            }
+        )
+    }
+
+    private fun showSingle(ctx: Context, title: String, label: String, initial: String, mid: String, field: String) {
+        showForm(
+            ctx, title, listOf(Field("v", label, 0, initial)),
+            { out ->
+                setMsgField(mid, field, (out["v"] ?: "").trim())
+                refreshChat()
+            },
+            {
+                setMsgField(mid, field, null)
+                refreshChat()
+            }
+        )
+    }
+
+    // ---------- pencils ----------
+    private fun pencil(ctx: Context, sizeDp: Int): Drawable? {
+        for (n in listOf("ic_edit_24dp", "ic_edit_white_24dp", "ic_pencil_24dp")) {
+            val id = Utils.getResId(n, "drawable")
+            if (id != 0) {
+                val d = ctx.getDrawable(id)?.mutate() ?: continue
+                d.setTint(cMuted)
+                val s = dp(ctx, sizeDp)
+                d.setBounds(0, 0, s, s)
+                return d
+            }
+        }
+        return null
+    }
+
+    private fun setPencil(tv: TextView?, on: Boolean, action: () -> Unit) {
+        if (tv == null) return
+        if (!on) {
+            if (penciled.remove(tv) != null) {
+                tv.setCompoundDrawablesRelative(null, null, null, null)
+                tv.setOnTouchListener(null)
+            }
+            return
+        }
+        if (tv.compoundDrawablesRelative[2] != null && !penciled.containsKey(tv)) return
+        val d = pencil(tv.context, 14) ?: return
+        tv.setCompoundDrawablesRelative(tv.compoundDrawablesRelative[0], null, d, null)
+        tv.compoundDrawablePadding = dp(tv.context, 6)
+        penciled[tv] = true
+        var downOnPencil = false
+        tv.setOnTouchListener { _, ev ->
+            val zone = dp(tv.context, 30)
+            val hit = ev.x >= tv.width - tv.paddingEnd - zone
+            when (ev.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downOnPencil = hit
+                    downOnPencil
+                }
+                MotionEvent.ACTION_UP -> {
+                    if (downOnPencil) {
+                        downOnPencil = false
+                        action()
+                        true
+                    } else false
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    downOnPencil = false
+                    false
+                }
+                else -> downOnPencil
+            }
+        }
+    }
+
+    // ---------- server tag / bot tag ----------
     private fun findGuildTag(v: View): View? {
         val n = idName(v)
         if (n != null && n != botTagId && guildKeys.any { n.contains(it) }) {
@@ -121,11 +462,6 @@ class LocalEditor : Plugin() {
             }
         }
         return null
-    }
-
-    private fun hide(root: View, v: View) {
-        v.visibility = View.GONE
-        hiddenByUs.getOrPut(root) { mutableListOf() }.add(v)
     }
 
     private fun hideImages(root: View, v: View) {
@@ -153,9 +489,9 @@ class LocalEditor : Plugin() {
         tv.text = text
         tv.filters = arrayOf<InputFilter>()
         tv.ellipsize = null
-        tv.setTextColor(0xFFFFFFFF.toInt())
+        tv.setTextColor(Color.WHITE)
         if (official) {
-            tv.backgroundTintList = ColorStateList.valueOf(0xFF5865F2.toInt())
+            tv.backgroundTintList = ColorStateList.valueOf(cBlurple)
             for (name in listOf("ic_verified_badge", "ic_verified_10dp", "ic_check_16dp")) {
                 val res = Utils.getResId(name, "drawable")
                 if (res != 0) {
@@ -164,7 +500,7 @@ class LocalEditor : Plugin() {
                 }
             }
         } else {
-            tv.backgroundTintList = ColorStateList.valueOf(0xFF4E5058.toInt())
+            tv.backgroundTintList = ColorStateList.valueOf(cGray)
             tv.setCompoundDrawablesWithIntrinsicBounds(0, 0, 0, 0)
         }
     }
@@ -176,124 +512,380 @@ class LocalEditor : Plugin() {
         tv.setCompoundDrawablesWithIntrinsicBounds(0, 0, 0, 0)
     }
 
-    // ---------- message rows ----------
-    private fun applyMessage(root: View, entry: MessageEntry) {
-        val msg = entry.message
-        hiddenByUs.remove(root)?.forEach { it.visibility = View.VISIBLE }
-
-        val newText = load("messages").optString(msg.id.toString(), "")
-        if (newText.isNotEmpty()) {
-            root.findViewById<TextView>(Utils.getResId("chat_list_adapter_item_text", "id"))?.text = newText
-        }
-
+    private fun applyTag(root: View, uc: JSONObject?) {
         val botTag = root.findViewById<TextView>(Utils.getResId(botTagId, "id"))
-        val uid = msg.author.id.toString()
-        val data = load("tagdata").optJSONObject(uid)
-        if (data == null || data.optString("t", "").isEmpty()) {
+        val text = uc?.optString("tag", "") ?: ""
+        val guild = findGuildTag(root)
+        if (uc == null || text.isEmpty()) {
             if (botTag != null) resetBotTag(botTag)
+            if (uc != null && uc.optBoolean("hideTag", false) && guild != null) hide(root, guild)
             return
         }
-        val text = data.optString("t", "")
-        val official = data.optBoolean("o", false)
-        val noBadge = data.optBoolean("nb", false)
-        val guild = findGuildTag(root)
-
+        val official = uc.optBoolean("official", false)
+        val noBadge = uc.optBoolean("hideBadge", false)
         if (guild != null && !official) {
             setGuildText(root, guild, text, noBadge)
             if (botTag != null) resetBotTag(botTag)
         } else {
-            if (official && guild != null) hide(root, guild)
+            if (guild != null && (official || uc.optBoolean("hideTag", false))) hide(root, guild)
             if (botTag != null) styleBotTag(botTag, text, official)
         }
     }
 
-    // ---------- dialogs ----------
-    private fun showMessageDialog(ctx: Context, msgId: String, current: String) {
-        val input = EditText(ctx)
-        input.setText(load("messages").optString(msgId, current))
-        input.setSelection(input.text.length)
-        val box = LinearLayout(ctx)
-        val p = dp(ctx, 20)
-        box.setPadding(p, p, p, 0)
-        box.addView(input, LinearLayout.LayoutParams(-1, -2))
-        AlertDialog.Builder(ctx)
-            .setTitle("Edit message (only you see this)")
-            .setView(box)
-            .setPositiveButton("Save") { _, _ ->
-                put("messages", msgId, input.text.toString())
-                refreshChat()
-            }
-            .setNeutralButton("Reset") { _, _ ->
-                put("messages", msgId, null)
-                refreshChat()
-            }
-            .setNegativeButton("Cancel", null)
-            .show()
+    // ---------- avatar + decoration ----------
+    private fun newDrawee(ctx: Context): ImageView? {
+        return try {
+            Class.forName("com.facebook.drawee.view.SimpleDraweeView")
+                .getConstructor(Context::class.java).newInstance(ctx) as ImageView
+        } catch (e: Throwable) {
+            null
+        }
     }
 
-    private fun showUserDialog(ctx: Context, uid: String, name: String) {
-        val cur = load("tagdata").optJSONObject(uid)
-
-        val tag = EditText(ctx)
-        tag.hint = "Tag text (any length, symbols OK)"
-        tag.setText(cur?.optString("t", "") ?: "")
-
-        val official = CheckBox(ctx)
-        official.text = "Official style (blue check tag, replaces server tag)"
-        official.isChecked = cur?.optBoolean("o", false) ?: false
-
-        val noBadge = CheckBox(ctx)
-        noBadge.text = "Hide the server tag icon"
-        noBadge.isChecked = cur?.optBoolean("nb", false) ?: false
-
-        val avatar = EditText(ctx)
-        avatar.hint = "Avatar image URL (direct link)"
-        avatar.setText(load("avatars").optString(uid, ""))
-
-        val box = LinearLayout(ctx)
-        box.orientation = LinearLayout.VERTICAL
-        val p = dp(ctx, 20)
-        box.setPadding(p, p, p, 0)
-        box.addView(tag)
-        box.addView(official)
-        box.addView(noBadge)
-        box.addView(avatar)
-
-        AlertDialog.Builder(ctx)
-            .setTitle("Edit $name (only you see this)")
-            .setView(box)
-            .setPositiveButton("Save") { _, _ ->
-                saveTag(uid, tag.text.toString().trim(), official.isChecked, noBadge.isChecked)
-                put("avatars", uid, avatar.text.toString().trim())
-                refreshChat()
-            }
-            .setNeutralButton("Reset all") { _, _ ->
-                clearUser(uid)
-                refreshChat()
-            }
-            .setNegativeButton("Cancel", null)
-            .show()
+    private fun setDraweeUrl(v: View, url: String) {
+        try {
+            v.javaClass.getMethod("setImageURI", String::class.java).invoke(v, url)
+        } catch (e: Throwable) {
+        }
     }
 
-    private fun makeMenuItem(ctx: Context, label: String): TextView {
-        val tv = TextView(ctx, null, 0, Utils.getResId("UiKit_Settings_Item_Icon", "style"))
-        tv.text = label
-        tv.tag = "le_edit"
-        for (n in listOf("ic_edit_24dp", "ic_edit_white_24dp", "ic_pencil_24dp")) {
-            val id = Utils.getResId(n, "drawable")
-            if (id != 0) {
-                val d = ctx.getDrawable(id)
-                d?.mutate()?.setTint(0xFFB5BAC1.toInt())
-                tv.setCompoundDrawablesWithIntrinsicBounds(d, null, null, null)
+    private fun applyAvatar(root: View, avatar: View?, uc: JSONObject?) {
+        val url = uc?.optString("avatar", "") ?: ""
+        if (avatar != null && url.isNotEmpty()) setDraweeUrl(avatar, url)
+
+        val deco = uc?.optString("deco", "") ?: ""
+        val old = root.findViewWithTag<View>("le_deco")
+        if (deco.isEmpty()) {
+            if (old != null) (old.parent as? ViewGroup)?.removeView(old)
+            return
+        }
+        walk(root) { v ->
+            val n = idName(v)?.lowercase()
+            if (n != null && n.contains("avatar") && n.contains("decoration") &&
+                v.visibility == View.VISIBLE && v.tag != "le_deco"
+            ) hide(root, v)
+        }
+        if (deco == "hide" || avatar == null) {
+            if (old != null) (old.parent as? ViewGroup)?.removeView(old)
+            return
+        }
+        val parent = avatar.parent as? ViewGroup ?: return
+        var ov = old as? ImageView
+        if (ov == null) {
+            ov = newDrawee(avatar.context) ?: return
+            ov.tag = "le_deco"
+            ov.isClickable = false
+            val lp = copyParams(avatar.layoutParams)
+            if (lp != null) ov.layoutParams = lp
+            parent.addView(ov, parent.indexOfChild(avatar) + 1)
+        }
+        ov.scaleX = 1.2f
+        ov.scaleY = 1.2f
+        if (decoUrls[ov] != deco) {
+            setDraweeUrl(ov, deco)
+            decoUrls[ov] = deco
+        }
+    }
+
+    // ---------- reply preview ----------
+    private fun findReplyText(v: View): TextView? {
+        val n = idName(v)?.lowercase()
+        if (v is TextView && n != null && n.contains("reply") &&
+            listOf("name", "time", "avatar", "icon", "tag", "label").none { n.contains(it) } &&
+            v.visibility == View.VISIBLE
+        ) return v
+        if (v is ViewGroup) {
+            for (i in 0 until v.childCount) {
+                val r = findReplyText(v.getChildAt(i))
+                if (r != null) return r
+            }
+        }
+        return null
+    }
+
+    // ---------- mentions follow renamed users ----------
+    private fun renameMentions(tv: TextView) {
+        val all = loadObj("users")
+        val keys = all.keys()
+        var sb: SpannableStringBuilder? = null
+        while (keys.hasNext()) {
+            val id = keys.next()
+            val newName = all.optJSONObject(id)?.optString("name", "") ?: ""
+            val old = origNames[id] ?: continue
+            if (newName.isEmpty() || newName == old) continue
+            val needle = "@$old"
+            val cur = sb ?: SpannableStringBuilder(tv.text)
+            var i = cur.indexOf(needle)
+            if (i < 0) continue
+            while (i >= 0) {
+                cur.replace(i, i + needle.length, "@$newName")
+                i = cur.indexOf(needle, i + newName.length + 1)
+            }
+            sb = cur
+        }
+        if (sb != null) tv.text = sb
+    }
+
+    // ---------- inline message editor ----------
+    private fun startInline(mid: String, current: String) {
+        val ov = loadObj("msgs").optJSONObject(mid)?.optString("content", "") ?: ""
+        draft = if (ov.isNotEmpty()) ov else current
+        editingMid = mid
+        refreshChat()
+    }
+
+    private fun removeInline(root: View) {
+        val box = root.findViewWithTag<View>("le_inline")
+        if (box != null) (box.parent as? ViewGroup)?.removeView(box)
+        val info = inlineInfo.remove(root)
+        if (info != null) {
+            info.content.visibility = View.VISIBLE
+            info.content.minHeight = info.oldMin
+        }
+    }
+
+    private fun smallButton(ctx: Context, text: String, color: Int, onClick: () -> Unit): TextView {
+        val b = makeButton(ctx, text, color, onClick)
+        val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        lp.setMargins(dp(ctx, 6), dp(ctx, 6), 0, 0)
+        b.layoutParams = lp
+        return b
+    }
+
+    private fun showInline(root: View, content: TextView, mid: String) {
+        try {
+            val parent = content.parent as? ViewGroup ?: throw IllegalStateException("no parent")
+            val constraint = parent.javaClass.name.contains("ConstraintLayout")
+            if (root.findViewWithTag<View>("le_inline") != null) {
+                content.visibility = if (constraint) View.INVISIBLE else View.GONE
+                return
+            }
+            val ctx = root.context
+            val box = LinearLayout(ctx)
+            box.orientation = LinearLayout.VERTICAL
+            box.tag = "le_inline"
+
+            val et = EditText(ctx)
+            et.setText(draft)
+            et.setTextColor(cText)
+            et.setHintTextColor(cMuted)
+            et.setTextSize(TypedValue.COMPLEX_UNIT_PX, content.textSize)
+            et.background = rounded(cDark, dp(ctx, 6))
+            val p = dp(ctx, 8)
+            et.setPadding(p, p, p, p)
+            et.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+            et.gravity = Gravity.TOP or Gravity.START
+            et.addTextChangedListener(object : TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                override fun afterTextChanged(s: Editable?) { draft = s?.toString() ?: "" }
+            })
+            box.addView(et, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+            val row = LinearLayout(ctx)
+            row.orientation = LinearLayout.HORIZONTAL
+            row.gravity = Gravity.END
+            row.addView(smallButton(ctx, "Cancel", cGray) {
+                editingMid = null
+                hideKeyboard(et)
+                refreshChat()
+            })
+            row.addView(smallButton(ctx, "Reset", cRed) {
+                setMsgField(mid, "content", null)
+                editingMid = null
+                hideKeyboard(et)
+                refreshChat()
+            })
+            row.addView(smallButton(ctx, "Save", cBlurple) {
+                setMsgField(mid, "content", draft.trim())
+                editingMid = null
+                hideKeyboard(et)
+                refreshChat()
+            })
+            box.addView(row, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+            val lp = copyParams(content.layoutParams)
+            if (lp != null) box.layoutParams = lp
+            inlineInfo[root] = InlineInfo(content, content.minHeight)
+            if (constraint) {
+                content.visibility = View.INVISIBLE
+                box.addOnLayoutChangeListener { _, _, top, _, bottom, _, oldTop, _, oldBottom ->
+                    val h = bottom - top
+                    if (h != oldBottom - oldTop) content.minHeight = h
+                }
+            } else {
+                content.visibility = View.GONE
+            }
+            parent.addView(box, parent.indexOfChild(content) + 1)
+            et.requestFocus()
+            et.postDelayed({
+                try {
+                    val imm = ctx.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+                    imm.showSoftInput(et, InputMethodManager.SHOW_IMPLICIT)
+                } catch (e: Throwable) {
+                }
+            }, 150)
+        } catch (e: Throwable) {
+            Log.e("LocalEditor", "inline editor failed, using dialog", e)
+            editingMid = null
+            removeInline(root)
+            showSingle(root.context, "Edit message", "Message text", draft, mid, "content")
+        }
+    }
+
+    // ---------- message rows ----------
+    private fun applyMessage(root: View, entry: MessageEntry) {
+        val msg = entry.message
+        val mid = msg.id.toString()
+        val uid = msg.author.id.toString()
+        val ctx = root.context
+        val uc = userCfg(uid)
+        val mc = loadObj("msgs").optJSONObject(mid)
+        val pencils = settings.getString("pencils", "1") == "1"
+
+        hiddenByUs.remove(root)?.forEach { it.visibility = View.VISIBLE }
+        if (editingMid != mid) removeInline(root)
+
+        // name
+        val nameTv = root.findViewById<TextView>(Utils.getResId("chat_list_adapter_item_text_name", "id"))
+        if (nameTv != null) {
+            val cur = nameTv.text.toString()
+            val custom = uc?.optString("name", "") ?: ""
+            if (custom.isNotEmpty()) {
+                if (cur != custom) origNames[uid] = cur
+                nameTv.text = custom
+            } else if (cur.isNotEmpty()) {
+                origNames[uid] = cur
+            }
+            setPencil(nameTv, pencils) { showUserForm(ctx, uid, origNames[uid] ?: cur) }
+        }
+
+        // timestamp
+        val timeTv = root.findViewById<TextView>(Utils.getResId("chat_list_adapter_item_text_timestamp", "id"))
+        val customTime = mc?.optString("time", "") ?: ""
+        if (timeTv != null && customTime.isNotEmpty()) timeTv.text = customTime
+        setPencil(timeTv, pencils) {
+            showSingle(
+                ctx, "Edit timestamp", "Timestamp text",
+                if (customTime.isNotEmpty()) customTime else (timeTv?.text?.toString() ?: ""),
+                mid, "time"
+            )
+        }
+
+        // message text
+        val content = root.findViewById<TextView>(Utils.getResId("chat_list_adapter_item_text", "id"))
+        if (content != null) {
+            val ov = mc?.optString("content", "") ?: ""
+            if (ov.isNotEmpty()) content.text = ov
+            renameMentions(content)
+            if (editingMid == mid) {
+                setPencil(content, false) {}
+                showInline(root, content, mid)
+            } else {
+                setPencil(content, pencils) { startInline(mid, content.text.toString()) }
+            }
+        }
+
+        // reply preview text
+        val replyTv = findReplyText(root)
+        val customReply = mc?.optString("replyText", "") ?: ""
+        if (replyTv != null && customReply.isNotEmpty()) replyTv.text = customReply
+        setPencil(replyTv, pencils) {
+            showSingle(
+                ctx, "Edit reply preview", "Quoted text",
+                if (customReply.isNotEmpty()) customReply else (replyTv?.text?.toString() ?: ""),
+                mid, "replyText"
+            )
+        }
+
+        // avatar, decoration, tag
+        val avatar = root.findViewById<View>(Utils.getResId("chat_list_adapter_item_text_avatar", "id"))
+        applyAvatar(root, avatar, uc)
+        applyTag(root, uc)
+    }
+
+    // ---------- profile screen ----------
+    private fun applyProfile(root: View, uid: String) {
+        val c = userCfg(uid) ?: return
+        val status = c.optString("status", "")
+        val statusText = c.optString("statusText", "")
+        val colors = mapOf(
+            "online" to 0xFF23A55A.toInt(), "idle" to 0xFFF0B232.toInt(),
+            "dnd" to 0xFFF23F43.toInt(), "offline" to 0xFF80848E.toInt()
+        )
+        walk(root) { v ->
+            val n = idName(v)?.lowercase() ?: ""
+            if (status.isNotEmpty() && v is ImageView &&
+                (n.contains("status") || n.contains("presence")) && !n.contains("text")
+            ) {
+                val col = colors[status]
+                if (col != null) v.setColorFilter(col, PorterDuff.Mode.SRC_IN)
+            }
+            if (statusText.isNotEmpty() && v is TextView &&
+                (n.contains("custom_status") || n.contains("status_text") || n.contains("presence_text"))
+            ) v.text = statusText
+        }
+    }
+
+    // ---------- menu item that matches the real buttons ----------
+    private fun addEditItem(layout: LinearLayout, label: String, onClick: () -> Unit) {
+        val ctx = layout.context
+        val wanted = listOf("edit", "reply", "forward", "copy text", "pin", "mark unread")
+        var tpl: TextView? = null
+        var tplIndex = -1
+        for (i in 0 until layout.childCount) {
+            val c = layout.getChildAt(i)
+            if (c is TextView && c.tag != "le_edit" && c.text.toString().trim().lowercase() in wanted) {
+                tpl = c
+                tplIndex = i
                 break
             }
         }
-        return tv
+        val item = TextView(ctx)
+        item.tag = "le_edit"
+        item.text = label
+        var insertAt = 0
+        val t = tpl
+        if (t != null) {
+            val lp = copyParams(t.layoutParams)
+            if (lp != null) item.layoutParams = lp
+            item.setPaddingRelative(t.paddingStart, t.paddingTop, t.paddingEnd, t.paddingBottom)
+            item.setTextSize(TypedValue.COMPLEX_UNIT_PX, t.textSize)
+            item.setTextColor(t.textColors)
+            item.typeface = t.typeface
+            item.gravity = t.gravity
+            item.minHeight = t.minHeight
+            item.compoundDrawablePadding = t.compoundDrawablePadding
+            val bg = t.background?.constantState?.newDrawable()
+            if (bg != null) item.background = bg
+
+            val isEdit = t.text.toString().trim().lowercase() == "edit"
+            val src = t.compoundDrawablesRelative[0] ?: t.compoundDrawables[0]
+            var icon: Drawable? = null
+            if (isEdit && src != null) icon = src.constantState?.newDrawable()?.mutate()
+            if (icon == null) icon = pencil(ctx, 24)
+            if (icon != null) {
+                if (src != null && src.bounds.width() > 0) icon.setBounds(0, 0, src.bounds.width(), src.bounds.height())
+                else if (icon.bounds.width() <= 0) icon.setBounds(0, 0, dp(ctx, 24), dp(ctx, 24))
+                item.setCompoundDrawablesRelative(icon, null, null, null)
+            }
+            insertAt = if (isEdit) tplIndex + 1 else tplIndex
+        } else {
+            item.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            item.setTextColor(cText)
+            item.setPadding(dp(ctx, 16), dp(ctx, 14), dp(ctx, 16), dp(ctx, 14))
+            item.compoundDrawablePadding = dp(ctx, 16)
+            val icon = pencil(ctx, 24)
+            if (icon != null) item.setCompoundDrawablesRelative(icon, null, null, null)
+        }
+        item.setOnClickListener { onClick() }
+        layout.addView(item, insertAt)
     }
 
     // ---------- debug dump ----------
     private fun dump(v: View, depth: Int, sb: StringBuilder) {
-        if (depth > 5) return
+        if (depth > 9 || sb.length > 14000) return
         sb.append("  ".repeat(depth)).append(v.javaClass.simpleName)
         val n = idName(v)
         if (n != null) sb.append(" #").append(n)
@@ -305,32 +897,21 @@ class LocalEditor : Plugin() {
         }
     }
 
-    private fun showDump() {
+    private fun showRowDump() {
         ui.post {
-            val rv = chatRef?.get()
-            if (rv == null) return@post
+            val rv = chatRef?.get() ?: return@post
             var target: View? = null
             for (i in 0 until rv.childCount) {
-                val nameView = findById(rv.getChildAt(i), "chat_list_adapter_item_text_name")
-                if (nameView != null) {
-                    val parent = nameView.parent as? View
-                    target = (parent?.parent as? View) ?: parent
+                val row = rv.getChildAt(i)
+                if (findById(row, "chat_list_adapter_item_text_name") != null) {
+                    target = row
                     break
                 }
             }
-            val ctx = rv.context
+            val t = target
             val sb = StringBuilder()
-            if (target == null) sb.append("No message header found on screen.")
-            else dump(target, 0, sb)
-            val tv = TextView(ctx)
-            tv.text = sb.toString()
-            tv.textSize = 10f
-            tv.setTextIsSelectable(true)
-            val p = dp(ctx, 12)
-            tv.setPadding(p, p, p, p)
-            val sv = ScrollView(ctx)
-            sv.addView(tv)
-            AlertDialog.Builder(ctx).setTitle("Header layout").setView(sv).setPositiveButton("OK", null).show()
+            if (t == null) sb.append("No message row on screen.") else dump(t, 0, sb)
+            showInfo(rv.context, "Message row layout", sb.toString())
         }
     }
 
@@ -344,7 +925,7 @@ class LocalEditor : Plugin() {
             ),
             Hook { param ->
                 val id = (param.args[0] as? Long)?.toString() ?: return@Hook
-                val url = load("avatars").optString(id, "")
+                val url = userCfg(id)?.optString("avatar", "") ?: ""
                 if (url.isNotEmpty()) param.result = url
             }
         )
@@ -366,7 +947,6 @@ class LocalEditor : Plugin() {
         }
     }
 
-    // adds "Edit locally" to the message three-dots / long-press menu
     private fun hookMessageActions() {
         val cls = Class.forName("com.discord.widgets.chat.list.actions.WidgetChatListActions")
         val m = cls.declaredMethods.first { it.name == "configureUI" }
@@ -378,20 +958,16 @@ class LocalEditor : Plugin() {
                 val msg = call(param.args[0], "getMessage") ?: return@Hook
                 val msgId = call(msg, "getId")?.toString() ?: return@Hook
                 val content = (call(msg, "getContent") as? String) ?: ""
-                val ctx = layout.context
-                val item = makeMenuItem(ctx, "Edit locally")
-                item.setOnClickListener {
+                addEditItem(layout, "Edit locally") {
                     call(param.thisObject, "dismiss")
-                    showMessageDialog(ctx, msgId, content)
+                    startInline(msgId, content)
                 }
-                layout.addView(item, 0)
             } catch (e: Throwable) {
                 Log.e("LocalEditor", "actions hook failed", e)
             }
         })
     }
 
-    // adds "Edit locally (tag / avatar)" at the bottom of the user profile sheet
     private fun hookUserSheet() {
         val cls = Class.forName("com.discord.widgets.user.usersheet.WidgetUserSheet")
         val m = cls.declaredMethods.first { it.name == "configureUI" }
@@ -399,84 +975,48 @@ class LocalEditor : Plugin() {
             try {
                 val view = call(param.thisObject, "getView") as? View ?: return@Hook
                 val content = view.findViewById<ViewGroup>(Utils.getResId("user_sheet_content", "id")) ?: return@Hook
-                if (content.findViewWithTag<View>("le_edit") != null) return@Hook
                 val user = call(param.args[0], "getUser") ?: return@Hook
                 val uid = call(user, "getId")?.toString() ?: return@Hook
                 val name = (call(user, "getUsername") as? String) ?: "user"
+                applyProfile(view, uid)
+                if (content.findViewWithTag<View>("le_edit") != null) return@Hook
                 val ctx = content.context
-                val item = makeMenuItem(ctx, "Edit locally (tag / avatar)")
-                item.setOnClickListener {
+                val btn = makeButton(ctx, "Edit locally", cBlurple) {
                     call(param.thisObject, "dismiss")
-                    showUserDialog(ctx, uid, name)
+                    showUserForm(ctx, uid, name)
                 }
-                content.addView(item)
+                btn.tag = "le_edit"
+                btn.layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                ).also { it.setMargins(dp(ctx, 16), dp(ctx, 8), dp(ctx, 16), dp(ctx, 8)) }
+                content.addView(btn)
             } catch (e: Throwable) {
                 Log.e("LocalEditor", "user sheet hook failed", e)
             }
         })
     }
 
-    // ---------- commands (fallback) ----------
     private fun registerCommands() {
-        val user = { Utils.createCommandOption(ApplicationCommandType.USER, "user", "Target user", required = true) }
-
-        commands.registerCommand(
-            "ltag", "Set a local tag on a user",
-            listOf(
-                user(),
-                Utils.createCommandOption(ApplicationCommandType.STRING, "text", "Tag text, any length", required = true),
-                Utils.createCommandOption(ApplicationCommandType.BOOLEAN, "official", "Blue check official-style tag"),
-                Utils.createCommandOption(ApplicationCommandType.BOOLEAN, "nobadge", "Hide the server tag icon")
-            )
-        ) { ctx ->
-            val id = ctx.getRequiredUser("user").id.toString()
-            saveTag(
-                id, ctx.getRequiredString("text"),
-                ctx.getBoolOrDefault("official", false), ctx.getBoolOrDefault("nobadge", false)
-            )
-            refreshChat()
-            CommandsAPI.CommandResult("Tag set.", null, false)
-        }
-
-        commands.registerCommand(
-            "lavatar", "Set a local avatar URL for a user",
-            listOf(
-                user(),
-                Utils.createCommandOption(ApplicationCommandType.STRING, "url", "Direct image link", required = true)
-            )
-        ) { ctx ->
-            put("avatars", ctx.getRequiredUser("user").id.toString(), ctx.getRequiredString("url"))
-            refreshChat()
-            CommandsAPI.CommandResult("Avatar set. Restart the app if it doesn't change.", null, false)
-        }
-
-        commands.registerCommand(
-            "lmsg", "Locally edit a message (needs the message ID)",
-            listOf(
-                Utils.createCommandOption(ApplicationCommandType.STRING, "id", "Message ID", required = true),
-                Utils.createCommandOption(ApplicationCommandType.STRING, "text", "New text", required = true)
-            )
-        ) { ctx ->
-            put("messages", ctx.getRequiredString("id"), ctx.getRequiredString("text"))
-            refreshChat()
-            CommandsAPI.CommandResult("Message edited.", null, false)
-        }
-
-        commands.registerCommand(
-            "lclear", "Remove local edits for a user",
-            listOf(user())
-        ) { ctx ->
-            clearUser(ctx.getRequiredUser("user").id.toString())
-            refreshChat()
-            CommandsAPI.CommandResult("Cleared.", null, false)
-        }
-
-        commands.registerCommand(
-            "ldump", "Debug: show the message header layout",
-            emptyList()
-        ) { _ ->
-            showDump()
+        commands.registerCommand("ldump", "Debug: dump the layout of a message row", emptyList()) { _ ->
+            showRowDump()
             CommandsAPI.CommandResult("Opening dump...", null, false)
+        }
+
+        commands.registerCommand(
+            "lpencils", "Show or hide the edit pencils",
+            listOf(Utils.createCommandOption(ApplicationCommandType.BOOLEAN, "enabled", "Show pencils", required = true))
+        ) { ctx ->
+            val on = ctx.getBoolOrDefault("enabled", true)
+            settings.setString("pencils", if (on) "1" else "0")
+            refreshChat()
+            CommandsAPI.CommandResult(if (on) "Pencils on." else "Pencils off.", null, false)
+        }
+
+        commands.registerCommand("lwipe", "Remove ALL local edits", emptyList()) { _ ->
+            settings.setString("users", "{}")
+            settings.setString("msgs", "{}")
+            refreshChat()
+            CommandsAPI.CommandResult("All local edits removed.", null, false)
         }
     }
     private fun hookChatList() {
@@ -498,10 +1038,9 @@ class LocalEditor : Plugin() {
             }
         }
     }
-    
     override fun start(context: Context) {
         safe("avatars") { hookAvatars() }
-        safe("messages") { hookMessages() }        
+        safe("messages") { hookMessages() }
         safe("chat list") { hookChatList() }
         safe("message actions") { hookMessageActions() }
         safe("user sheet") { hookUserSheet() }
@@ -511,5 +1050,6 @@ class LocalEditor : Plugin() {
     override fun stop(context: Context) {
         patcher.unpatchAll()
         commands.unregisterAll()
+        editingMid = null
     }
 }

@@ -479,10 +479,30 @@ class LocalEditor : Plugin() {
             CommandsAPI.CommandResult("Opening dump...", null, false)
         }
     }
-
+    private fun hookChatList() {
+        patcher.after<WidgetChatListAdapterItemMessage>(
+            "onConfigure", Int::class.java, ChatListEntry::class.java
+        ) { param ->
+            try {
+                val root = (param.thisObject as RecyclerView.ViewHolder).itemView
+                val cur = chatRef?.get()
+                if (cur == null || !cur.isAttachedToWindow) {
+                    root.post {
+                        var p: android.view.ViewParent? = root.parent
+                        while (p != null && p !is RecyclerView) p = p.parent
+                        if (p is RecyclerView) chatRef = WeakReference(p)
+                    }
+                }
+            } catch (e: Throwable) {
+                Log.e("LocalEditor", "chat list hook failed", e)
+            }
+        }
+    }
+    
     override fun start(context: Context) {
         safe("avatars") { hookAvatars() }
-        safe("messages") { hookMessages() }
+        safe("messages") { hookMessages() }        
+        safe("chat list") { hookChatList() }
         safe("message actions") { hookMessageActions() }
         safe("user sheet") { hookUserSheet() }
         safe("commands") { registerCommands() }

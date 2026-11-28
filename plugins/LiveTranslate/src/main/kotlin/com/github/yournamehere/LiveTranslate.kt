@@ -633,7 +633,6 @@ class LiveTranslate : Plugin() {
 
     // ---------- cleaning text before the model sees it ----------
     private val stretchRegex = Regex("([\\p{IsLatin}\\p{IsCyrillic}])\\1{2,}")
-    private val wordRegex = Regex("\\S+")
 
     private fun isSpecialToken(tok: String): Boolean {
         return tok.contains("://") || tok.startsWith("@") || tok.startsWith("#") ||
@@ -644,13 +643,20 @@ class LiveTranslate : Plugin() {
     // adds a final period. Links, mentions, #channels and :emoji: are left alone.
     private fun cleanForTranslate(text: String): String {
         val sb = StringBuilder()
-        var last = 0
         var capNext = true
         var lastSpecial = false
-        for (m in wordRegex.findAll(text)) {
-            sb.append(text, last, m.range.first)
-            last = m.range.last + 1
-            var tok = m.value
+        var i = 0
+        val len = text.length
+        while (i < len) {
+            val ch = text[i]
+            if (ch.isWhitespace()) {
+                sb.append(ch)
+                i++
+                continue
+            }
+            var j = i
+            while (j < len && !text[j].isWhitespace()) j++
+            var tok = text.substring(i, j)
             val special = isSpecialToken(tok)
             if (!special) {
                 tok = stretchRegex.replace(tok, "\$1")
@@ -661,8 +667,8 @@ class LiveTranslate : Plugin() {
             sb.append(tok)
             capNext = !special && (tok.endsWith(".") || tok.endsWith("!") || tok.endsWith("?"))
             lastSpecial = special
+            i = j
         }
-        sb.append(text, last, text.length)
         var out = sb.toString().trim()
         if (out.isNotEmpty() && !lastSpecial) {
             val c = out.last()

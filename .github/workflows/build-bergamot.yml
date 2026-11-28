@@ -1,0 +1,229 @@
+name: Build Bergamot (Android arm64)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-bergamot.yml'
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 170
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build cmake git
+
+      - name: Clone Bergamot
+        run: |
+          git clone --recursive https://github.com/browsermt/bergamot-translator.git
+          cd bergamot-translator
+          git log -1 --format='%H %ad'
+
+      - name: Add stub header and JNI bridge
+        run: |
+          mkdir -p stubs
+          cat > stubs/execinfo.h <<'EOF'
+          #pragma once
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+          static inline int backtrace(void** buffer, int size) { return 0; }
+          static inline char** backtrace_symbols(void* const* buffer, int size) { return 0; }
+          static inline void backtrace_symbols_fd(void* const* buffer, int size, int fd) {}
+          #ifdef __cplusplus
+          }
+          #endif
+          EOF
+
+          mkdir -p bergamot-translator/jni_shim
+          cat > bergamot-translator/jni_shim/bergamot_jni.cpp <<'EOF'
+          #include <jni.h>
+          #include <memory>
+          #include <mutex>
+          #include <string>
+          #include <vector>
+
+          #include "common/logging.h"
+          #include "translator/parser.h"
+          #include "translator/response.h"
+          #include "translator/response_options.h"
+          #include "translator/service.h"
+          #include "translator/translation_model.h"
+
+          using marian::bergamot::BlockingService;
+          using marian::bergamot::MemoryBundle;
+          using marian::bergamot::ResponseOptions;
+          using marian::bergamot::TranslationModel;
+
+          static std::mutex g_mu;
+          static std::unique_ptr<BlockingService> g_service;
+          static std::shared_ptr<TranslationModel> g_model;
+          static std::string g_err = "";
+
+          static std::string ascii(const std::string& s) {
+            std::string o;
+            for (unsigned char c : s) o.push_back((c >= 32 && c < 127) ? (char)c : '?');
+            return o;
+          }
+
+          static void ensureService() {
+            if (!g_service) {
+              marian::setThrowExceptionOnAbort(true);
+              BlockingService::Config cfg;
+              cfg.cacheSize = 0;
+              g_service.reset(new BlockingService(cfg));
+            }
+          }
+
+          extern "C" JNIEXPORT jboolean JNICALL
+          Java_com_github_yournamehere_NativeBergamot_nInit(JNIEnv*, jobject) {
+            std::lock_guard<std::mutex> lk(g_mu);
+            try {
+              ensureService();
+              return JNI_TRUE;
+            } catch (const std::exception& e) {
+              g_err = e.what();
+            } catch (...) {
+              g_err = "unknown error in init";
+            }
+            return JNI_FALSE;
+          }
+
+          extern "C" JNIEXPORT jboolean JNICALL
+          Java_com_github_yournamehere_NativeBergamot_nLoad(JNIEnv* env, jobject, jstring jpath) {
+            const char* p = env->GetStringUTFChars(jpath, nullptr);
+            std::string path(p ? p : "");
+            if (p) env->ReleaseStringUTFChars(jpath, p);
+            std::lock_guard<std::mutex> lk(g_mu);
+            try {
+              ensureService();
+              g_model.reset();
+              auto options = marian::bergamot::parseOptionsFromFilePath(path, false);
+              g_model = std::make_shared<TranslationModel>(options, MemoryBundle{}, 1);
+              return JNI_TRUE;
+            } catch (const std::exception& e) {
+              g_err = e.what();
+            } catch (...) {
+              g_err = "unknown error loading model";
+            }
+            g_model.reset();
+            return JNI_FALSE;
+          }
+
+          extern "C" JNIEXPORT void JNICALL
+          Java_com_github_yournamehere_NativeBergamot_nUnload(JNIEnv*, jobject) {
+            std::lock_guard<std::mutex> lk(g_mu);
+            g_model.reset();
+          }
+
+          extern "C" JNIEXPORT jbyteArray JNICALL
+          Java_com_github_yournamehere_NativeBergamot_nTranslate(JNIEnv* env, jobject, jbyteArray jin) {
+            jsize n = env->GetArrayLength(jin);
+            std::string in((size_t)n, '\0');
+            if (n > 0) env->GetByteArrayRegion(jin, 0, n, reinterpret_cast<jbyte*>(&in[0]));
+            std::lock_guard<std::mutex> lk(g_mu);
+            try {
+              if (!g_service || !g_model) {
+                g_err = "engine not ready";
+                return nullptr;
+              }
+              ResponseOptions opts;
+              std::vector<std::string> sources;
+              sources.push_back(in);
+              auto responses = g_service->translateMultiple(g_model, std::move(sources), opts);
+              const std::string& out = responses[0].target.text;
+              jbyteArray arr = env->NewByteArray((jsize)out.size());
+              env->SetByteArrayRegion(arr, 0, (jsize)out.size(), reinterpret_cast<const jbyte*>(out.data()));
+              return arr;
+            } catch (const std::exception& e) {
+              g_err = e.what();
+            } catch (...) {
+              g_err = "unknown error translating";
+            }
+            return nullptr;
+          }
+
+          extern "C" JNIEXPORT jstring JNICALL
+          Java_com_github_yournamehere_NativeBergamot_nError(JNIEnv* env, jobject) {
+            std::lock_guard<std::mutex> lk(g_mu);
+            return env->NewStringUTF(ascii(g_err).c_str());
+          }
+
+          extern "C" JNIEXPORT jstring JNICALL
+          Java_com_github_yournamehere_NativeBergamot_nInfo(JNIEnv* env, jobject) {
+            std::string s = "bergamot jni, compiler ";
+            s += __VERSION__;
+          #if defined(__aarch64__)
+            s += ", aarch64";
+          #elif defined(__arm__)
+            s += ", arm32";
+          #endif
+            return env->NewStringUTF(ascii(s).c_str());
+          }
+          EOF
+
+          printf '\nadd_library(bergamot_jni SHARED ${CMAKE_CURRENT_LIST_DIR}/jni_shim/bergamot_jni.cpp)\ntarget_link_libraries(bergamot_jni PRIVATE bergamot-translator log)\n' >> bergamot-translator/CMakeLists.txt
+          tail -5 bergamot-translator/CMakeLists.txt
+
+      - name: Configure
+        run: |
+          cmake -S bergamot-translator -B build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-30 -DANDROID_STL=c++_static \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS="-w -O2 -I$GITHUB_WORKSPACE/stubs" \
+            -DCMAKE_CXX_FLAGS="-w -O2 -I$GITHUB_WORKSPACE/stubs" \
+            -DBUILD_ARCH=armv8-a -DCOMPILE_CPU=ON -DCOMPILE_CUDA=OFF \
+            -DCOMPILE_TESTS=OFF -DCOMPILE_LIBRARY_ONLY=ON -DCOMPILE_WASM=OFF -DUSE_WASM_COMPATIBILITY=OFF \
+            -DUSE_INTGEMM=OFF -DUSE_RUY=ON -DUSE_RUY_SGEMM=ON -DUSE_FBGEMM=OFF \
+            -DUSE_SENTENCEPIECE=ON -DUSE_STATIC_LIBS=ON \
+            -DSSPLIT_USE_INTERNAL_PCRE2=ON -DSSPLIT_COMPILE_LIBRARY_ONLY=ON \
+            2>&1 | tee configure.log
+
+      - name: Build
+        run: |
+          cmake --build build --target bergamot_jni -j 3 2>&1 | tee build.log
+
+      - name: Show errors
+        if: failure()
+        run: |
+          echo "===== first errors ====="
+          grep -n -E "error:|fatal error|undefined reference|CMake Error|Could NOT|ninja: build stopped" configure.log build.log | head -40 || true
+          echo "===== last lines of build log ====="
+          tail -25 build.log || true
+
+      - name: Collect library
+        run: |
+          LIB=$(find build -name libbergamot_jni.so | head -1)
+          echo "found: $LIB"
+          cp "$LIB" libbergamot_jni.so
+          $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip --strip-unneeded libbergamot_jni.so
+          ls -l libbergamot_jni.so
+
+      - name: Publish library
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: bergamot-android-arm64
+          name: Bergamot native library (Android arm64)
+          files: libbergamot_jni.so
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            configure.log
+            build.log

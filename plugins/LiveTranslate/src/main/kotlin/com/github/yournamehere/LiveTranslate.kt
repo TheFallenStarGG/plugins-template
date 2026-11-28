@@ -443,7 +443,7 @@ class LiveTranslate : Plugin() {
             sb.append("vocabs:\n")
             for (v in vocabLines) sb.append("  - ").append(v).append('\n')
             sb.append("shortlist:\n  - ").append(loc.lex).append("\n  - false\n")
-            sb.append("beam-size: 1\nnormalize: 1.0\nword-penalty: 0\nmax-length-break: 128\n")
+            sb.append("beam-size: 1\nnormalize: 1.0\nword-penalty: 0\nmax-length-break: 128\nmini-batch-words: 1024\n")
             sb.append("mean-length-penalty: 0\nmax-length-factor: 2.0\nskip-cost: true\ncpu-threads: 0\n")
             sb.append("quiet: true\nquiet-translation: true\nworkspace: 64\nalignment: soft\n")
             sb.append("gemm-precision: ").append(prec).append('\n')

@@ -142,7 +142,8 @@ jobs:
                 g_err = "engine not ready";
                 return nullptr;
               }
-              ResponseOptions opts;
+              std::vector<ResponseOptions> opts;
+              opts.push_back(ResponseOptions());
               std::vector<std::string> sources;
               sources.push_back(in);
               auto responses = g_service->translateMultiple(g_model, std::move(sources), opts);
@@ -219,6 +220,8 @@ jobs:
           cp "$LIB" libbergamot_jni.so
           $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip --strip-unneeded libbergamot_jni.so
           ls -l libbergamot_jni.so
+          echo "exported JNI functions:"
+          $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm -D --defined-only libbergamot_jni.so | grep Java_ || true
 
       - name: Publish library
         uses: softprops/action-gh-release@v2

@@ -57,6 +57,7 @@ class TranslateButtons : Plugin() {
     private var btnRef: WeakReference<View>? = null
     private var lastRow: WeakReference<View>? = null
     private var emojiWidth = 0
+    private var lastSetup = "never ran"
     private val ui = Handler(Looper.getMainLooper())
 
     private val cIcon = 0xFFB5BAC1.toInt()
@@ -139,6 +140,17 @@ class TranslateButtons : Plugin() {
         } catch (e: Throwable) {
             ViewGroup.LayoutParams(lp.width, lp.height)
         }
+    }
+
+    private fun decor(): View? = try {
+        Utils.appActivity?.window?.decorView
+    } catch (e: Throwable) {
+        null
+    }
+
+    private fun byId(root: View, name: String): View? {
+        val id = Utils.getResId(name, "id")
+        return if (id != 0) root.findViewById(id) else null
     }
 
     // ---------- translation (same Google endpoint the old plugin used) ----------
@@ -313,7 +325,8 @@ class TranslateButtons : Plugin() {
             }
         }.start()
     }
-        // ---------- the button on each message ----------
+
+    // ---------- the button on each message ----------
     private fun buildParams(
         group: ViewGroup, anchor: View?, size: Int, endMargin: Int, center: Boolean
     ): ViewGroup.LayoutParams? {
@@ -467,17 +480,17 @@ class TranslateButtons : Plugin() {
 
     // ---------- the text-bar button ----------
     private fun findEmoji(root: View): View? {
-        var byId: View? = null
+        var byIdMatch: View? = null
         var byDesc: View? = null
         walk(root) { v ->
             if (v is ImageView) {
                 val n = idName(v)?.lowercase() ?: ""
                 val d = v.contentDescription?.toString()?.lowercase() ?: ""
-                if (byId == null && n.contains("emoji")) byId = v
+                if (byIdMatch == null && (n.contains("emoji") || n == "expression_btn")) byIdMatch = v
                 if (byDesc == null && (d.contains("emoji") || d.contains("sticker"))) byDesc = v
             }
         }
-        return byId ?: byDesc
+        return byIdMatch ?: byDesc
     }
 
     private fun applyEmojiState() {
@@ -512,43 +525,73 @@ class TranslateButtons : Plugin() {
     }
 
     private fun setupInput(root: View) {
-        inputRoot = WeakReference(root)
-        val existing = root.findViewWithTag<View>("tb_input")
-        if (existing != null) {
-            btnRef = WeakReference(existing)
+        try {
+            val emojiNow = byId(root, "expression_btn")
+            val existing = root.findViewWithTag<View>("tb_input")
+            if (existing != null && existing.isAttachedToWindow) {
+                btnRef = WeakReference(existing)
+                if (emojiNow != null) emojiRef = WeakReference(emojiNow)
+                applyEmojiState()
+                lastSetup = "already installed"
+                return
+            }
+
+            var input = byId(root, "text_input") as? EditText
+            if (input == null) {
+                var found: EditText? = null
+                walk(root) { v -> if (found == null && v is EditText) found = v }
+                input = found
+            }
+            if (input == null) {
+                lastSetup = "text input not found"
+                return
+            }
+
+            val emoji = emojiNow ?: findEmoji(root)
+            if (emoji == null) {
+                lastSetup = "emoji button not found"
+                return
+            }
+            val parent = emoji.parent as? ViewGroup
+            if (parent == null) {
+                lastSetup = "emoji button has no parent"
+                return
+            }
+            val iconId = Utils.getResId("ic_locale_24dp", "drawable")
+            if (iconId == 0) {
+                lastSetup = "ic_locale_24dp drawable missing"
+                return
+            }
+
+            val ctx = root.context
+            val btn = ImageView(ctx)
+            btn.tag = "tb_input"
+            btn.setImageDrawable(ctx.getDrawable(iconId)?.mutate())
+            btn.setColorFilter(cIcon)
+            btn.contentDescription = "Translate"
+            if (emoji is ImageView) btn.scaleType = emoji.scaleType
+            btn.setPadding(emoji.paddingLeft, emoji.paddingTop, emoji.paddingRight, emoji.paddingBottom)
+            val bg = emoji.background?.constantState?.newDrawable()
+            if (bg != null) btn.background = bg
+            val lp = copyParams(emoji.layoutParams)
+            if (lp != null) btn.layoutParams = lp
+            val target = input
+            btn.setOnClickListener { translateInput(target) }
+
+            emojiWidth = emoji.width
+            parent.addView(btn, parent.indexOfChild(emoji) + 1)
+            inputRoot = WeakReference(root)
+            emojiRef = WeakReference(emoji)
+            btnRef = WeakReference(btn)
+            emoji.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
+                if (hideEmoji() && v.visibility == View.VISIBLE) v.post { applyEmojiState() }
+            }
             applyEmojiState()
-            return
+            lastSetup = "ok"
+        } catch (e: Throwable) {
+            lastSetup = "threw: ${e.javaClass.simpleName}: ${e.message}"
+            Log.e("TranslateButtons", "setupInput failed", e)
         }
-        var found: EditText? = null
-        walk(root) { v -> if (found == null && v is EditText) found = v }
-        val input = found ?: return
-        val emoji = findEmoji(root) ?: return
-        val parent = emoji.parent as? ViewGroup ?: return
-        val ctx = root.context
-        val iconId = Utils.getResId("ic_locale_24dp", "drawable")
-        if (iconId == 0) return
-
-        val btn = ImageView(ctx)
-        btn.tag = "tb_input"
-        btn.setImageDrawable(ctx.getDrawable(iconId)?.mutate())
-        btn.setColorFilter(cIcon)
-        btn.contentDescription = "Translate"
-        if (emoji is ImageView) btn.scaleType = emoji.scaleType
-        btn.setPadding(emoji.paddingLeft, emoji.paddingTop, emoji.paddingRight, emoji.paddingBottom)
-        val bg = emoji.background?.constantState?.newDrawable()
-        if (bg != null) btn.background = bg
-        val lp = copyParams(emoji.layoutParams)
-        if (lp != null) btn.layoutParams = lp
-        btn.setOnClickListener { translateInput(input) }
-
-        emojiWidth = emoji.width
-        parent.addView(btn, parent.indexOfChild(emoji) + 1)
-        emojiRef = WeakReference(emoji)
-        btnRef = WeakReference(btn)
-        emoji.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
-            if (hideEmoji() && v.visibility == View.VISIBLE) v.post { applyEmojiState() }
-        }
-        applyEmojiState()
     }
 
     // ---------- debug ----------
@@ -571,8 +614,12 @@ class TranslateButtons : Plugin() {
         val row = lastRow?.get()
         sb.append("Message row root: ").append(row?.javaClass?.name ?: "none yet").append('\n')
         sb.append("Emoji button found: ").append(emojiRef?.get() != null).append('\n')
+        sb.append("Translate button attached: ").append(btnRef?.get()?.isAttachedToWindow == true).append('\n')
+        sb.append("Setup status: ").append(lastSetup).append('\n')
         sb.append("Fragments seen: ").append(seenFrags.joinToString(", ")).append("\n\n")
-        val r = inputRoot?.get()
+        val d = decor()
+        val live = if (d != null) byId(d, "chat_input_container") else null
+        val r = live ?: inputRoot?.get()
         if (r == null) sb.append("Chat input not seen yet. Open a channel first.") else dump(r, 0, sb)
         return sb.toString()
     }
@@ -691,7 +738,7 @@ class TranslateButtons : Plugin() {
 
         commands.registerCommand("tbdump", "Debug: dump the chat input layout", emptyList()) { _ ->
             ui.post {
-                val ctx = inputRoot?.get()?.context ?: chatRef?.get()?.context
+                val ctx: Context? = inputRoot?.get()?.context ?: chatRef?.get()?.context ?: decor()?.context
                 if (ctx != null) showInfo(ctx, "Chat input layout", buildDump())
             }
             CommandsAPI.CommandResult("Opening dump...", null, false)
@@ -712,15 +759,22 @@ class TranslateButtons : Plugin() {
     }
 
     private fun ensureInput() {
-        val root = inputRoot?.get() ?: return
-        if (!root.isAttachedToWindow) return
         val b = btnRef?.get()
         val e = emojiRef?.get()
-        if (b == null || e == null || !b.isAttachedToWindow || !e.isAttachedToWindow || b.parent !== e.parent) {
-            setupInput(root)
-        } else {
+        if (b != null && e != null && b.isAttachedToWindow && e.isAttachedToWindow && b.parent === e.parent) {
             applyEmojiState()
+            return
         }
+        val root = decor()
+        if (root == null) {
+            lastSetup = "no activity window"
+            return
+        }
+        if (byId(root, "text_input") == null && byId(root, "expression_btn") == null) {
+            lastSetup = "chat input not on screen"
+            return
+        }
+        setupInput(root)
     }
 
     override fun start(context: Context) {

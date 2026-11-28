@@ -698,7 +698,34 @@ class TranslateButtons : Plugin() {
         }
     }
 
+    private var running = false
+    private val poller = object : Runnable {
+        override fun run() {
+            if (!running) return
+            try {
+                ensureInput()
+            } catch (e: Throwable) {
+                Log.e("TranslateButtons", "ensure failed", e)
+            }
+            ui.postDelayed(this, 1000)
+        }
+    }
+
+    private fun ensureInput() {
+        val root = inputRoot?.get() ?: return
+        if (!root.isAttachedToWindow) return
+        val b = btnRef?.get()
+        val e = emojiRef?.get()
+        if (b == null || e == null || !b.isAttachedToWindow || !e.isAttachedToWindow || b.parent !== e.parent) {
+            setupInput(root)
+        } else {
+            applyEmojiState()
+        }
+    }
+
     override fun start(context: Context) {
+        running = true
+        ui.post(poller)
         safe("rows") { hookRows() }
         safe("text") { hookText() }
         safe("menu") { hookMenu() }
@@ -707,6 +734,8 @@ class TranslateButtons : Plugin() {
     }
 
     override fun stop(context: Context) {
+        running = false
+        ui.removeCallbacks(poller)
         patcher.unpatchAll()
         commands.unregisterAll()
     }

@@ -19,6 +19,7 @@ import android.text.style.ForegroundColorSpan
 import android.text.style.RelativeSizeSpan
 import android.util.Log
 import android.util.LruCache
+import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -48,6 +49,7 @@ import java.io.File
 import java.lang.ref.WeakReference
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLEncoder
 import java.security.MessageDigest
 
 // The C++ side (built by the GitHub workflow) registers these exact names.
@@ -65,11 +67,16 @@ class LiveTranslate : Plugin() {
 
     private class Job(val mid: Long, val text: String)
     private class Local(val model: String, val lex: String, val vocabs: List<String>)
-    private class Pick(val files: List<JSONObject>, val totalSize: Long)
+    private class Pick(val files: List<JSONObject>, val totalSize: Long, val version: String)
 
     private val libUrl = "https://github.com/TheFallenStarGG/plugins-template/releases/download/bergamot-android-arm64/libbergamot_jni.so"
     private val recordsUrl = "https://firefox.settings.services.mozilla.com/v1/buckets/main/collections/translations-models/records"
     private val attachBase = "https://firefox-settings-attachments.cdn.mozilla.net/"
+
+    // models bigger than this (all files together) are never picked
+    private val maxModelBytes = 100L * 1024L * 1024L
+    // bump this to make the plugin re-download models picked by an older rule
+    private val pickRule = 2
 
     private val ui = Handler(Looper.getMainLooper())
     private var engineThread: HandlerThread? = null
@@ -101,16 +108,28 @@ class LiveTranslate : Plugin() {
     private val cBg = 0xFF313338.toInt()
     private val cText = 0xFFDBDEE1.toInt()
     private val cBlurple = 0xFF5865F2.toInt()
+    private val cIcon = 0xFFB5BAC1.toInt()
 
     // ---------- small helpers ----------
     private fun enabled() = settings.getString("enabled", "1") == "1"
     private fun labelOn() = settings.getString("label", "1") == "1"
+    private fun cleanOn() = settings.getString("clean", "1") == "1"
+    private fun beam(): Int = settings.getString("beam", "2").toIntOrNull()?.coerceIn(1, 4) ?: 2
 
     private fun dp(ctx: Context, v: Int) = (v * ctx.resources.displayMetrics.density).toInt()
 
     private fun call(o: Any?, name: String): Any? {
         if (o == null) return null
         return try { o.javaClass.getMethod(name).invoke(o) } catch (e: Throwable) { null }
+    }
+
+    private fun copyParams(lp: ViewGroup.LayoutParams?): ViewGroup.LayoutParams? {
+        if (lp == null) return null
+        return try {
+            lp.javaClass.getConstructor(lp.javaClass).newInstance(lp) as ViewGroup.LayoutParams
+        } catch (e: Throwable) {
+            ViewGroup.LayoutParams(lp.width, lp.height)
+        }
     }
 
     private fun log(s: String) {
@@ -322,19 +341,36 @@ class LiveTranslate : Plugin() {
         return arr
     }
 
-    // smallest stable version of the (lang -> en) model that has all its files
+    private fun versionParts(v: String): List<Int> = v.split(".").map { it.toIntOrNull() ?: 0 }
+
+    private fun isNewer(a: String, b: String): Boolean {
+        val x = versionParts(a)
+        val y = versionParts(b)
+        for (i in 0 until maxOf(x.size, y.size)) {
+            val p = x.getOrElse(i) { 0 }
+            val q = y.getOrElse(i) { 0 }
+            if (p != q) return p > q
+        }
+        return false
+    }
+
+    // newest stable version of the (lang -> en) model that has all its files
+    // and whose files add up to at most maxModelBytes
     private fun pickFiles(lang: String, arr: JSONArray): Pick? {
-        val byVersion = HashMap<String, MutableMap<String, MutableList<JSONObject>>>()
+        val groups = HashMap<String, MutableMap<String, MutableList<JSONObject>>>()
+        val versionOf = HashMap<String, String>()
         val stable = Regex("[0-9]+(\\.[0-9]+)*")
         for (i in 0 until arr.length()) {
             val r = arr.getJSONObject(i)
             if (r.optString("fromLang") != lang || r.optString("toLang") != "en") continue
             val v = r.optString("version")
             if (!stable.matches(v)) continue
-            byVersion.getOrPut(v) { HashMap() }.getOrPut(r.optString("fileType")) { mutableListOf() }.add(r)
+            val key = v + "|" + r.optString("variant")
+            versionOf[key] = v
+            groups.getOrPut(key) { HashMap() }.getOrPut(r.optString("fileType")) { mutableListOf() }.add(r)
         }
         var best: Pick? = null
-        for ((_, types) in byVersion) {
+        for ((key, types) in groups) {
             val model = types["model"]?.firstOrNull() ?: continue
             val lex = types["lex"]?.firstOrNull() ?: continue
             val files = ArrayList<JSONObject>()
@@ -353,8 +389,12 @@ class LiveTranslate : Plugin() {
             }
             var size = 0L
             for (f in files) size += f.optJSONObject("attachment")?.optLong("size") ?: 0L
+            if (size > maxModelBytes) continue
+            val ver = versionOf[key] ?: continue
             val b = best
-            if (b == null || size < b.totalSize) best = Pick(files, size)
+            if (b == null || isNewer(ver, b.version) || (ver == b.version && size > b.totalSize)) {
+                best = Pick(files, size, ver)
+            }
         }
         return best
     }
@@ -375,13 +415,15 @@ class LiveTranslate : Plugin() {
         if (meta.exists()) {
             try {
                 val m = JSONObject(meta.readText())
-                val model = File(dir, m.getString("model"))
-                val lex = File(dir, m.getString("lex"))
-                val vs = m.getJSONArray("vocabs")
-                val vocabs = ArrayList<String>()
-                for (i in 0 until vs.length()) vocabs.add(File(dir, vs.getString(i)).absolutePath)
-                if (model.exists() && lex.exists() && vocabs.all { File(it).exists() }) {
-                    return Local(model.absolutePath, lex.absolutePath, vocabs)
+                if (m.optInt("rule", 0) == pickRule) {
+                    val model = File(dir, m.getString("model"))
+                    val lex = File(dir, m.getString("lex"))
+                    val vs = m.getJSONArray("vocabs")
+                    val vocabs = ArrayList<String>()
+                    for (i in 0 until vs.length()) vocabs.add(File(dir, vs.getString(i)).absolutePath)
+                    if (model.exists() && lex.exists() && vocabs.all { File(it).exists() }) {
+                        return Local(model.absolutePath, lex.absolutePath, vocabs)
+                    }
                 }
             } catch (e: Throwable) {
             }
@@ -394,7 +436,7 @@ class LiveTranslate : Plugin() {
         }
         val pick = pickFiles(lang, arr)
         if (pick == null) {
-            lastError = "no usable model for $lang"
+            lastError = "no usable model for $lang (under ${maxModelBytes / 1048576} MB)"
             log(lastError)
             return null
         }
@@ -426,13 +468,16 @@ class LiveTranslate : Plugin() {
         out.put("model", modelName)
         out.put("lex", lexName)
         out.put("vocabs", vocabNames)
+        out.put("rule", pickRule)
+        out.put("version", pick.version)
         meta.writeText(out.toString())
         val vocabs = ArrayList<String>()
         for (i in 0 until vocabNames.length()) vocabs.add(File(dir, vocabNames.getString(i)).absolutePath)
-        log("model $lang downloaded (${pick.totalSize / 1048576} MB)")
+        log("model $lang v${pick.version} downloaded (${pick.totalSize / 1048576} MB)")
         return Local(File(dir, modelName).absolutePath, File(dir, lexName).absolutePath, vocabs)
     }
-        // ---------- loading / unloading the one model ----------
+
+    // ---------- loading / unloading the one model ----------
     private fun tryLoad(lang: String, loc: Local): Boolean {
         val n = native ?: return false
         val cfg = File(modelDir(lang), "config.yml")
@@ -443,13 +488,14 @@ class LiveTranslate : Plugin() {
             sb.append("vocabs:\n")
             for (v in vocabLines) sb.append("  - ").append(v).append('\n')
             sb.append("shortlist:\n  - ").append(loc.lex).append("\n  - false\n")
-            sb.append("beam-size: 1\nnormalize: 1.0\nword-penalty: 0\nmax-length-break: 128\nmini-batch-words: 1024\n")
+            sb.append("beam-size: ").append(beam()).append('\n')
+            sb.append("normalize: 1.0\nword-penalty: 0\nmax-length-break: 128\nmini-batch-words: 1024\n")
             sb.append("mean-length-penalty: 0\nmax-length-factor: 2.0\nskip-cost: true\ncpu-threads: 0\n")
             sb.append("quiet: true\nquiet-translation: true\nworkspace: 64\nalignment: soft\n")
             sb.append("gemm-precision: ").append(prec).append('\n')
             cfg.writeText(sb.toString())
             if (n.nLoad(cfg.absolutePath)) {
-                log("model $lang loaded (precision $prec)")
+                log("model $lang loaded (precision $prec, beam ${beam()})")
                 return true
             }
             lastError = n.nError()
@@ -585,6 +631,49 @@ class LiveTranslate : Plugin() {
         return mapLang(loc.toLanguageTag())
     }
 
+    // ---------- cleaning text before the model sees it ----------
+    private val stretchRegex = Regex("([\\p{IsLatin}\\p{IsCyrillic}])\\1{2,}")
+    private val wordRegex = Regex("\\S+")
+
+    private fun isSpecialToken(tok: String): Boolean {
+        return tok.contains("://") || tok.startsWith("@") || tok.startsWith("#") ||
+            tok.startsWith("<") || (tok.length > 2 && tok.startsWith(":") && tok.endsWith(":"))
+    }
+
+    // collapses stretched letters (jaaaa -> ja), capitalizes sentence starts,
+    // adds a final period. Links, mentions, #channels and :emoji: are left alone.
+    private fun cleanForTranslate(text: String): String {
+        val sb = StringBuilder()
+        var last = 0
+        var capNext = true
+        var lastSpecial = false
+        for (m in wordRegex.findAll(text)) {
+            sb.append(text, last, m.range.first)
+            last = m.range.last + 1
+            var tok = m.value
+            val special = isSpecialToken(tok)
+            if (!special) {
+                tok = stretchRegex.replace(tok, "\$1")
+                if (capNext && tok.isNotEmpty() && tok[0].isLowerCase()) {
+                    tok = tok.substring(0, 1).uppercase() + tok.substring(1)
+                }
+            }
+            sb.append(tok)
+            capNext = !special && (tok.endsWith(".") || tok.endsWith("!") || tok.endsWith("?"))
+            lastSpecial = special
+        }
+        sb.append(text, last, text.length)
+        var out = sb.toString().trim()
+        if (out.isNotEmpty() && !lastSpecial) {
+            val c = out.last()
+            val sc = Character.UnicodeScript.of(c.code)
+            if (c.isLetterOrDigit() && (sc == Character.UnicodeScript.LATIN || sc == Character.UnicodeScript.CYRILLIC || c.isDigit())) {
+                out += "."
+            }
+        }
+        return out
+    }
+
     // ---------- queue (newest message first, max 12 waiting) ----------
     private fun enqueue(mid: Long, text: String) {
         synchronized(pending) {
@@ -621,7 +710,8 @@ class LiveTranslate : Plugin() {
             if (!ensureModel(lang)) return
             val n = native ?: return
             val t0 = SystemClock.elapsedRealtime()
-            val out = n.nTranslate(job.text.take(2000).toByteArray(Charsets.UTF_8))
+            val src = if (cleanOn()) cleanForTranslate(job.text) else job.text
+            val out = n.nTranslate(src.take(2000).toByteArray(Charsets.UTF_8))
             if (out == null) {
                 lastError = n.nError()
                 log("translate failed: $lastError")
@@ -643,6 +733,78 @@ class LiveTranslate : Plugin() {
         } finally {
             synchronized(pending) { pending.remove(job.mid) }
         }
+    }
+
+    // ---------- Google backup (long-press a message) ----------
+    private fun googleChunk(text: String): Array<String> {
+        val url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q=" +
+            URLEncoder.encode(text, "UTF-8")
+        val conn = URL(url).openConnection() as HttpURLConnection
+        try {
+            conn.requestMethod = "GET"
+            conn.connectTimeout = 10000
+            conn.readTimeout = 15000
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0")
+            val code = conn.responseCode
+            if (code == 429) throw IllegalStateException("Google rate limit reached. Try again later.")
+            if (code != 200) throw IllegalStateException("Google translate failed (HTTP $code).")
+            val body = conn.inputStream.bufferedReader().use { it.readText() }
+            val root = JSONArray(body)
+            val parts = root.getJSONArray(0)
+            val sb = StringBuilder()
+            for (i in 0 until parts.length()) {
+                val p = parts.optJSONArray(i) ?: continue
+                sb.append(p.optString(0, ""))
+            }
+            val src = if (root.length() > 2) root.optString(2, "auto") else "auto"
+            return arrayOf(sb.toString(), src)
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    private fun googleTranslate(text: String): Array<String> {
+        if (text.length <= 1500) return googleChunk(text)
+        val out = StringBuilder()
+        var src = "auto"
+        val buf = StringBuilder()
+        for (line in text.split("\n")) {
+            if (buf.isNotEmpty() && buf.length + line.length + 1 > 1500) {
+                val r = googleChunk(buf.toString())
+                out.append(r[0])
+                src = r[1]
+                buf.setLength(0)
+            }
+            buf.append(line).append('\n')
+        }
+        if (buf.isNotEmpty()) {
+            val r = googleChunk(buf.toString())
+            out.append(r[0])
+            src = r[1]
+        }
+        return arrayOf(out.toString().trimEnd('\n'), src)
+    }
+
+    private fun googleRetranslate(mid: Long, raw: String) {
+        if (raw.isBlank()) return
+        toastUi("LiveTranslate: translating with Google...")
+        Thread {
+            try {
+                val r = googleTranslate(raw.take(4000))
+                if (r[1] == "en" || r[0].isBlank() || r[0].trim() == raw.trim()) {
+                    toastUi("Google says this is already English")
+                } else {
+                    cache.put(mid, r[0])
+                    labels.put(mid, r[1] + ", google")
+                    skip.remove(mid)
+                    log("google translated $mid (${r[1]})")
+                    refreshMessage(mid)
+                }
+            } catch (e: Throwable) {
+                log("google failed: ${e.javaClass.simpleName}: ${e.message}")
+                toastUi(e.message ?: "Google translate failed")
+            }
+        }.start()
     }
 
     // ---------- chat list ----------
@@ -743,7 +905,92 @@ class LiveTranslate : Plugin() {
             }
         })
     }
-        // ---------- status, test, commands ----------
+
+    // ---------- long-press menu item ----------
+    private fun addMenuItem(layout: LinearLayout, label: String, onClick: () -> Unit) {
+        val ctx = layout.context
+        val wanted = listOf("edit", "reply", "forward", "copy text", "pin", "mark unread")
+        var tpl: TextView? = null
+        var idx = -1
+        for (i in 0 until layout.childCount) {
+            val c = layout.getChildAt(i)
+            if (c !is TextView) continue
+            val s = c.text.toString().trim().lowercase()
+            if (s == "copy text") {
+                tpl = c
+                idx = i
+            } else if (tpl == null && s in wanted) {
+                tpl = c
+                idx = i
+            }
+        }
+        val item = TextView(ctx)
+        item.tag = "lt_menu"
+        item.text = label
+        val iconId = Utils.getResId("ic_locale_24dp", "drawable")
+        val icon = if (iconId != 0) ctx.getDrawable(iconId)?.mutate() else null
+        val t = tpl
+        var insertAt = layout.childCount
+        if (t != null) {
+            val lp = copyParams(t.layoutParams)
+            if (lp != null) item.layoutParams = lp
+            item.setPaddingRelative(t.paddingStart, t.paddingTop, t.paddingEnd, t.paddingBottom)
+            item.setTextSize(TypedValue.COMPLEX_UNIT_PX, t.textSize)
+            item.setTextColor(t.textColors)
+            item.typeface = t.typeface
+            item.gravity = t.gravity
+            item.minHeight = t.minHeight
+            item.compoundDrawablePadding = t.compoundDrawablePadding
+            val bg = t.background?.constantState?.newDrawable()
+            if (bg != null) item.background = bg
+            val src = t.compoundDrawablesRelative[0] ?: t.compoundDrawables[0]
+            if (icon != null) {
+                if (src != null && src.bounds.width() > 0) icon.setBounds(0, 0, src.bounds.width(), src.bounds.height())
+                else icon.setBounds(0, 0, dp(ctx, 24), dp(ctx, 24))
+                val tint = t.compoundDrawableTintList
+                if (tint != null) icon.setTintList(tint) else icon.setTint(cIcon)
+                item.setCompoundDrawablesRelative(icon, null, null, null)
+            }
+            insertAt = if (t.text.toString().trim().lowercase() == "copy text") idx + 1 else idx
+        } else {
+            item.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            item.setTextColor(cText)
+            item.setPadding(dp(ctx, 16), dp(ctx, 14), dp(ctx, 16), dp(ctx, 14))
+            item.compoundDrawablePadding = dp(ctx, 16)
+            if (icon != null) {
+                icon.setBounds(0, 0, dp(ctx, 24), dp(ctx, 24))
+                icon.setTint(cIcon)
+                item.setCompoundDrawablesRelative(icon, null, null, null)
+            }
+        }
+        item.setOnClickListener { onClick() }
+        layout.addView(item, insertAt)
+    }
+
+    private fun hookMenu() {
+        val cls = Class.forName("com.discord.widgets.chat.list.actions.WidgetChatListActions")
+        val m = cls.declaredMethods.first { it.name == "configureUI" }
+        patcher.patch(m, Hook { param ->
+            try {
+                val view = call(param.thisObject, "getView") as? ViewGroup ?: return@Hook
+                val layout = view.getChildAt(0) as? LinearLayout ?: return@Hook
+                if (layout.findViewWithTag<View>("lt_menu") != null) return@Hook
+                val msg = call(param.args[0], "getMessage") ?: return@Hook
+                val mid = call(msg, "getId") as? Long ?: return@Hook
+                val raw = (call(msg, "getContent") as? String) ?: ""
+                if (raw.isBlank()) return@Hook
+                val label = if (cache[mid] != null) "Redo with Google" else "Translate with Google"
+                addMenuItem(layout, label) {
+                    call(param.thisObject, "dismiss")
+                    googleRetranslate(mid, raw)
+                }
+            } catch (e: Throwable) {
+                Log.e("LiveTranslate", "menu hook failed", e)
+            }
+        })
+    }
+
+    // ---------- status, test, commands ----------
     private fun dirSize(d: File): Long {
         var s = 0L
         val files = d.listFiles() ?: return 0L
@@ -751,9 +998,15 @@ class LiveTranslate : Plugin() {
         return s
     }
 
+    private fun modelVersion(d: File): String {
+        return try { JSONObject(File(d, "meta.json").readText()).optString("version", "?") } catch (e: Throwable) { "?" }
+    }
+
     private fun statusText(): String {
         val sb = StringBuilder()
         sb.append("enabled: ").append(enabled()).append(", language tags: ").append(labelOn()).append('\n')
+        sb.append("text cleanup: ").append(cleanOn()).append(", beam size: ").append(beam()).append('\n')
+        sb.append("model size cap: ").append(maxModelBytes / 1048576).append(" MB\n")
         sb.append("64-bit process: ").append(Process.is64Bit()).append('\n')
         sb.append("engine library: ").append(
             if (libReady) "loaded" else if (libBroken) "BROKEN: $libError" else if (libError.isNotEmpty()) libError else "not loaded yet (loads on first foreign message)"
@@ -764,7 +1017,7 @@ class LiveTranslate : Plugin() {
         sb.append("cache: ").append(cache.size()).append("/200 messages, waiting: ").append(waiting).append('\n')
         val dirs = appCtx?.let { File(baseDir(), "models").listFiles() }
         sb.append("models on disk: ").append(
-            if (dirs == null || dirs.isEmpty()) "none" else dirs.joinToString(", ") { "${it.name} (${dirSize(it) / 1048576} MB)" }
+            if (dirs == null || dirs.isEmpty()) "none" else dirs.joinToString(", ") { "${it.name} v${modelVersion(it)} (${dirSize(it) / 1048576} MB)" }
         ).append('\n')
         sb.append("last error: ").append(if (lastError.isEmpty()) "none" else lastError)
         return sb.toString()
@@ -780,13 +1033,15 @@ class LiveTranslate : Plugin() {
                 if (lang == null || lang == "en") {
                     sb.append("nothing to translate (English or unsure)\n")
                 } else if (!supported(lang)) {
-                    sb.append("no Mozilla model for $lang\n")
+                    sb.append("no Mozilla model for $lang (under ${maxModelBytes / 1048576} MB)\n")
                 } else if (!ensureModel(lang)) {
                     sb.append("model not ready. error: ").append(lastError).append(" / library: ").append(libError).append('\n')
                 } else {
                     val n = native
                     val t0 = SystemClock.elapsedRealtime()
-                    val out = n?.nTranslate(text.take(2000).toByteArray(Charsets.UTF_8))
+                    val src = if (cleanOn()) cleanForTranslate(text) else text
+                    if (src != text) sb.append("cleaned input: ").append(src).append('\n')
+                    val out = n?.nTranslate(src.take(2000).toByteArray(Charsets.UTF_8))
                     if (out == null) {
                         sb.append("translate failed: ").append(n?.nError()).append('\n')
                     } else {
@@ -840,6 +1095,36 @@ class LiveTranslate : Plugin() {
             CommandsAPI.CommandResult(if (on) "Language tags on." else "Language tags off.", null, false)
         }
 
+        commands.registerCommand(
+            "ltclean", "Turn text cleanup before translating on or off",
+            listOf(Utils.createCommandOption(ApplicationCommandType.BOOLEAN, "enabled", "On or off", required = true))
+        ) { ctx ->
+            val on = ctx.getBoolOrDefault("enabled", true)
+            settings.setString("clean", if (on) "1" else "0")
+            CommandsAPI.CommandResult(
+                if (on) "Text cleanup on (applies to messages translated from now on)."
+                else "Text cleanup off (applies to messages translated from now on).", null, false
+            )
+        }
+
+        commands.registerCommand(
+            "ltbeam", "Set the search width, 1 to 4 (higher = better but slower, default 2)",
+            listOf(Utils.createCommandOption(ApplicationCommandType.STRING, "size", "A number from 1 to 4", required = true))
+        ) { ctx ->
+            val n = ctx.getRequiredString("size").trim().toIntOrNull()
+            if (n == null || n < 1 || n > 4) {
+                CommandsAPI.CommandResult("Use a number from 1 to 4.", null, false)
+            } else {
+                settings.setString("beam", n.toString())
+                engine.post {
+                    native?.nUnload()
+                    loadedLang = null
+                    log("beam set to $n, model unloaded so it reloads with the new setting")
+                }
+                CommandsAPI.CommandResult("Beam size set to $n. The model reloads on the next message.", null, false)
+            }
+        }
+
         commands.registerCommand("ltwipe", "Delete downloaded models and the translation cache", emptyList()) { _ ->
             engine.post {
                 native?.nUnload()
@@ -870,6 +1155,7 @@ class LiveTranslate : Plugin() {
         engine = Handler(t.looper)
         try { hookRows() } catch (e: Throwable) { Log.e("LiveTranslate", "rows failed", e) }
         try { hookText() } catch (e: Throwable) { Log.e("LiveTranslate", "text failed", e) }
+        try { hookMenu() } catch (e: Throwable) { Log.e("LiveTranslate", "menu failed", e) }
         try { registerCommands() } catch (e: Throwable) { Log.e("LiveTranslate", "commands failed", e) }
         engine.postDelayed({ cleanupOld() }, 30000L)
     }
